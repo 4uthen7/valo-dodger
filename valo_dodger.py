@@ -302,44 +302,50 @@ def _trunc(x, n=300):
 # ---------------------------------------------------------------------------
 
 def detect_player_side(api: ValoAPI, player_data: dict) -> Optional[str]:
+    """pregame match の AllyTeam.TeamID からサイドを判定。
+
+    pregame の API は StartingSide を持たない。
+    Teams 配列 + AllyTeam の TeamID のみ。Valorant の仕様上:
+      Blue  = Defense スタート (防衛)
+      Red   = Attack スタート (攻め)
+    で固定。
+    """
     match_id = player_data.get("MatchID") or player_data.get("MatchId")
     if not match_id:
-        LOG.warning("player_data に MatchID なし: %s", _trunc(player_data))
+        LOG.warning("MatchID なし: %s", _trunc(player_data))
         return None
 
     match_data = api.get_pregame_match(match_id)
     if not match_data:
         return None
 
-    teams = match_data.get("Teams", [])
-    if len(teams) < 2:
-        LOG.warning("Teams < 2: %s", _trunc(match_data))
+    # AllyTeam は必ずプレイヤー自身のチーム
+    ally = match_data.get("AllyTeam", {})
+    player_team_id = ally.get("TeamID") or ally.get("TeamId")
+
+    if not player_team_id:
+        # AllyTeam がない場合 Teams 配列から PUUID で検索
+        teams = match_data.get("Teams", [])
+        for team in teams:
+            for p in team.get("Players", []):
+                if p.get("Subject") == api.puuid:
+                    player_team_id = team.get("TeamID") or team.get("TeamId")
+                    break
+            if player_team_id:
+                break
+
+    if not player_team_id:
+        LOG.warning("TeamID 取得不可。match=%s", _trunc(match_data, 500))
         return None
 
-    player_team_id = player_data.get("TeamID") or player_data.get("TeamId")
+    # Convention: Blue=Defense, Red=Attack
+    side = "Defense" if player_team_id == "Blue" else "Attack" if player_team_id == "Red" else None
 
-    team_side_map: dict[str, str] = {}
-    for team in teams:
-        tid = team.get("TeamID") or team.get("TeamId")
-        starting_side = (
-            team.get("StartingSide")
-            or team.get("Side")
-            or team.get("InitialSide")
-        )
-        if starting_side:
-            team_side_map[tid] = starting_side.capitalize()
+    if side is None:
+        LOG.warning("未知の TeamID: '%s'", player_team_id)
+        return None
 
-    if player_team_id not in team_side_map:
-        if player_team_id == "Red":
-            team_side_map[player_team_id] = "Attack"
-        elif player_team_id == "Blue":
-            team_side_map[player_team_id] = "Defense"
-        else:
-            LOG.warning("TeamID '%s' 不明. teams=%s", player_team_id, _trunc(teams, 500))
-            return None
-
-    side = team_side_map.get(player_team_id)
-    LOG.info("side: TeamID=%s → %s", player_team_id, side)
+    LOG.info("side: AllyTeam=%s → %s", player_team_id, side)
     return side
 
 
