@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
-Valorant Auto-Dodger v3
+Valorant Auto-Dodger v4
 =======================
-v2 からの修正:
-- 毎回トークンをリフレッシュ（有効期限切れ対策）
-- region/shard 検出のフォールバック追加（riot-geo API）
-- 動的プラットフォームヘッダー生成
-- 全 HTTP レスポンスボディをログ出力（--verbose 時）
-- User-Agent: '' ヘッダー追加
+v3 からの主な変更:
+- 妨害方法を「味方に届く」ものに全面刷新
+  - プリゲームチャット爆撃（ローカルAPI経由＝安全）
+  - エージェント連続切り替え（GLZ select = 通常操作）
+  - CPU飽和/プロセス優先度操作は削除（自分にしか効かないため）
+- GLZ quit（ドッジ）はデフォルトで無効化。comboモード時のみ最終手段として使用
+- banリスク最小化のため GLZ API 呼び出し頻度を抑制
+
+モード:
+  sabotage = チャット爆撃 + エージェント切替で味方を追い出す（自分は抜けない）
+  combo    = 妨害 → 誰も抜けなければ最終手段で自分がドッジ
+  dodge    = 即ドッジ（非推奨）
 """
 
 import argparse
 import base64
 import json
 import logging
-import multiprocessing
 import os
 import platform
+import random
 import re
 import signal
 import ssl
@@ -48,7 +54,7 @@ def shooterlog_path() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Platform header (動的生成)
+# Platform header
 # ---------------------------------------------------------------------------
 
 def _build_platform_b64() -> str:
@@ -79,16 +85,10 @@ def _ssl_ctx():
 
 
 # ---------------------------------------------------------------------------
-# Low-level HTTP
+# HTTP
 # ---------------------------------------------------------------------------
 
-def _http(
-    method: str,
-    url: str,
-    headers: Optional[dict] = None,
-    body: Optional[bytes] = None,
-    timeout: float = 8.0,
-) -> tuple[int, Union[dict, str, bytes]]:
+def _http(method, url, headers=None, body=None, timeout=8.0):
     LOG.debug("→ %s %s", method, url[:120])
     req = urllib.request.Request(url, data=body, method=method)
     if headers:
@@ -99,18 +99,14 @@ def _http(
         with urllib.request.urlopen(req, timeout=timeout,
                                      context=_ssl_ctx() if use_ctx else None) as resp:
             raw = resp.read()
-            LOG.debug("← HTTP %s (%d bytes): %s",
-                      resp.status, len(raw),
-                      raw[:300].decode(errors="replace"))
+            LOG.debug("← HTTP %s (%d bytes)", resp.status, len(raw))
             try:
                 return resp.status, json.loads(raw)
             except json.JSONDecodeError:
                 return resp.status, raw.decode(errors="replace")
     except urllib.error.HTTPError as e:
         body_raw = e.read()
-        LOG.debug("← HTTP %s (%d bytes): %s",
-                  e.code, len(body_raw),
-                  body_raw[:500].decode(errors="replace"))
+        LOG.debug("← HTTP %s (%d bytes)", e.code, len(body_raw))
         try:
             return e.code, json.loads(body_raw)
         except json.JSONDecodeError:
@@ -143,85 +139,63 @@ class ValoAPI:
         self._fetch_region_info()
 
     def _refresh_tokens(self) -> None:
-        """毎回トークンを再取得（有効期限切れ対策）。"""
         status, data = _http(
-            "GET",
-            f"{self._local_base}/entitlements/v1/token",
+            "GET", f"{self._local_base}/entitlements/v1/token",
             headers={"Authorization": f"Basic {self._basic}"},
         )
         if status != 200:
-            raise RuntimeError(f"トークン取得失敗 HTTP {status}: {_trunc(data)}")
-
+            raise RuntimeError(f"トークン取得失敗 HTTP {status}")
         self._access_token = data["accessToken"]
         self._entitlements = data.get("token", "")
         self._puuid = data.get("subject", "")
-
-        if not self._puuid or not self._entitlements:
-            raise RuntimeError(f"PUUID/entitlements 取得不可: {_trunc(data)}")
-
-        LOG.info("tokens refreshed: puuid=%s...", self._puuid[:12])
+        if not self._puuid:
+            raise RuntimeError("PUUID 取得不可")
+        LOG.info("tokens: puuid=%s...", self._puuid[:12])
 
     def _fetch_region_info(self) -> None:
-        """region/shard/version を取得。ShooterGame.log → riot-geo API の順に試行。"""
         region, shard, ver = (None, None, None)
-
-        # 方法1: ShooterGame.log
         slog = shooterlog_path()
         if slog.exists():
             text = slog.read_text(encoding="utf-8", errors="replace")
             m = re.findall(r"https://glz-(.+?)-1\.(.+?)\.a\.pvp\.net", text)
             if m:
-                region, shard = m[-1]  # 最後のマッチ（最新）
+                region, shard = m[-1]
             m2 = re.search(r"CI server version:\s*(\S+)", text)
             if m2:
                 ver = m2.group(1)
-
-        # 方法2: riot-geo API
         if not region or not shard:
-            LOG.info("ShooterGame.log から region 未検出 → riot-geo API を試行")
+            LOG.info("ShooterGame.log 未検出 → riot-geo")
             try:
-                geo_headers = {
-                    "Authorization": f"Bearer {self._access_token}",
-                    "Content-Type": "application/json",
-                }
                 status, data = _http(
                     "PUT",
                     "https://riot-geo.pas.si.riotgames.com/pas/v1/product/valorant",
-                    headers=geo_headers,
+                    headers={"Authorization": f"Bearer {self._access_token}",
+                             "Content-Type": "application/json"},
                     body=b"{}",
                 )
                 if status == 200 and isinstance(data, dict):
                     region = data.get("affinity", "ap")
                     shard = data.get("location", "jp")
-                    LOG.info("riot-geo: region=%s shard=%s", region, shard)
-            except Exception as e:
-                LOG.warning("riot-geo 失敗: %s", e)
-
-        # 方法3: デフォルト（日本）
+            except Exception:
+                pass
         if not region:
             region = "ap"
         if not shard:
             shard = "jp"
-
-        # version fallback
         if not ver:
-            LOG.info("version 未検出 → valorant-api.com")
             try:
                 req = urllib.request.Request(
                     "https://valorant-api.com/v1/version",
-                    headers={"User-Agent": ""},
-                )
+                    headers={"User-Agent": ""})
                 with urllib.request.urlopen(req, timeout=10) as resp:
-                    vdata = json.loads(resp.read())
-                ver = vdata["data"]["riotClientVersion"]
+                    ver = json.loads(resp.read())["data"]["riotClientVersion"]
             except Exception:
                 ver = "unknown"
-
         self._region = region
         self._shard = shard
         self._client_version = ver
         self._glz_base = f"https://glz-{region}-1.{shard}.a.pvp.net"
-        LOG.info("GLZ base=%s version=%s", self._glz_base, ver)
+        LOG.info("GLZ=%s ver=%s", self._glz_base, ver)
 
     # -- headers --
 
@@ -234,51 +208,103 @@ class ValoAPI:
             "User-Agent": "",
         }
 
-    # -- GLZ requests (with token refresh) --
+    def _local_headers(self) -> dict:
+        return {"Authorization": f"Basic {self._basic}"}
+
+    # -- GLZ (pregame) --
 
     def glz_get(self, path: str) -> tuple[int, Union[dict, str]]:
-        self._refresh_tokens()
         url = f"{self._glz_base}{path}"
         return _http("GET", url, headers=self._game_headers())
 
-    def glz_post(self, path: str) -> tuple[int, Union[dict, str]]:
-        self._refresh_tokens()
+    def glz_post(self, path: str, body: Optional[bytes] = None) -> tuple[int, Union[dict, str]]:
         url = f"{self._glz_base}{path}"
-        return _http("POST", url, headers=self._game_headers())
+        return _http("POST", url, headers=self._game_headers(), body=body)
+
+    # -- Local API --
+
+    def local_get(self, path: str) -> tuple[int, Union[dict, str]]:
+        return _http("GET", f"{self._local_base}{path}",
+                     headers=self._local_headers())
+
+    def local_post(self, path: str, body: dict) -> tuple[int, Union[dict, str]]:
+        return _http("POST", f"{self._local_base}{path}",
+                     headers=self._local_headers(),
+                     body=json.dumps(body).encode())
 
     # -- pregame --
 
     def get_pregame_player(self) -> Optional[dict]:
         path = f"/pregame/v1/players/{self._puuid}"
         status, data = self.glz_get(path)
-
         if status == 404:
-            LOG.debug("pregame: not in match (404)")
             return None
         if status != 200:
-            LOG.warning("pregame player HTTP %s: %s", status, _trunc(data))
+            LOG.warning("pregame player HTTP %s", status)
             return None
-
-        LOG.info("pregame: IN MATCH — %s", _trunc(data))
+        LOG.info("pregame: IN MATCH")
         return data
 
     def get_pregame_match(self, match_id: str) -> Optional[dict]:
-        path = f"/pregame/v1/matches/{match_id}"
-        status, data = self.glz_get(path)
+        status, data = self.glz_get(f"/pregame/v1/matches/{match_id}")
         if status != 200:
-            LOG.warning("pregame match HTTP %s: %s", status, _trunc(data))
+            LOG.warning("pregame match HTTP %s", status)
             return None
-        LOG.info("pregame match: %s", _trunc(data))
         return data
+
+    def select_agent(self, match_id: str, agent_id: str) -> bool:
+        path = f"/pregame/v1/matches/{match_id}/select/{agent_id}"
+        status, _ = self.glz_post(path)
+        return status == 200
 
     def quit_pregame(self, match_id: str) -> bool:
         path = f"/pregame/v1/matches/{match_id}/quit"
-        status, data = self.glz_post(path)
+        status, _ = self.glz_post(path)
         if status == 200:
             LOG.info("DODGE SUCCESS")
             return True
-        LOG.warning("dodge failed HTTP %s: %s", status, _trunc(data))
+        LOG.warning("dodge failed HTTP %s", status)
         return False
+
+    def get_agents(self) -> list[str]:
+        """使用可能なエージェントのUUIDリストを取得。"""
+        status, data = self.glz_get(
+            f"/pregame/v1/matches/{self._last_match_id}/loadouts"
+        )
+        # フォールバック：既知のエージェントID
+        return [
+            "add6443a-41bd-e414-f6ad-e58d267f4e95",  # Jett
+            "a3bfb853-43b2-7238-a4f1-ad90e9e46bcc",  # Reyna
+            "569fdd95-4d10-43ab-ca70-79becc718b46",  # Sage
+            "707eab51-4836-f488-046a-cda6bf494859",  # Phoenix
+            "eb93336a-449b-9c1b-0a54-a891f7921d69",  # Raze
+            "9f0d8ba9-4140-b941-57d3-a7ad57c6b417",  # Brimstone
+            "f94c3b30-42be-e959-889c-5aa313dba261",  # Viper
+            "1dbf2edd-4729-0984-3115-daa5eed44993",  # Breach
+            "117ed9e3-49f3-6512-3ccf-0cada7e3823b",  # Cypher
+            "320b2a48-4d9b-a075-30f1-1f93a9b638fa",  # Sova
+            "1e58de9e-4250-9012-b2ac-89ffe26b0f58",  # Killjoy
+            "95b78ed7-4637-86d9-7e41-71ba8c293152",  # Skye
+            "601dbbe7-43ce-be57-2a40-4abd24953621",  # Yoru
+            "8e253930-4c05-31dd-1b6c-968525494517",  # Omen
+            "cc8b64c8-4b25-4a69-6e47-8e75bfc8e1e7",  # Gekko
+        ]
+
+    # -- pregame chat spam --
+
+    def get_pregame_cid(self) -> Optional[str]:
+        """ares-pregame の会話IDを取得。"""
+        status, data = self.local_get("/chat/v6/conversations/ares-pregame")
+        if status == 200 and isinstance(data, dict):
+            return data.get("cid") or data.get("id")
+        return None
+
+    def send_chat(self, cid: str, message: str) -> bool:
+        body = {"cid": cid, "message": message, "type": "groupchat"}
+        status, _ = self.local_post(
+            f"/chat/v6/conversations/{cid}/messages", body
+        )
+        return status == 200
 
     @property
     def puuid(self) -> str:
@@ -302,112 +328,69 @@ def _trunc(x, n=300):
 # ---------------------------------------------------------------------------
 
 def detect_player_side(api: ValoAPI, player_data: dict) -> Optional[str]:
-    """pregame match の AllyTeam.TeamID からサイドを判定。
-
-    pregame の API は StartingSide を持たない。
-    Teams 配列 + AllyTeam の TeamID のみ。Valorant の仕様上:
-      Blue  = Defense スタート (防衛)
-      Red   = Attack スタート (攻め)
-    で固定。
-    """
+    """AllyTeam.TeamID からサイド判定。Blue=Defense, Red=Attack。"""
     match_id = player_data.get("MatchID") or player_data.get("MatchId")
     if not match_id:
-        LOG.warning("MatchID なし: %s", _trunc(player_data))
+        LOG.warning("MatchID なし")
         return None
 
     match_data = api.get_pregame_match(match_id)
     if not match_data:
         return None
 
-    # AllyTeam は必ずプレイヤー自身のチーム
     ally = match_data.get("AllyTeam", {})
-    player_team_id = ally.get("TeamID") or ally.get("TeamId")
+    tid = ally.get("TeamID") or ally.get("TeamId")
 
-    if not player_team_id:
-        # AllyTeam がない場合 Teams 配列から PUUID で検索
-        teams = match_data.get("Teams", [])
-        for team in teams:
+    if not tid:
+        for team in match_data.get("Teams", []):
             for p in team.get("Players", []):
                 if p.get("Subject") == api.puuid:
-                    player_team_id = team.get("TeamID") or team.get("TeamId")
+                    tid = team.get("TeamID") or team.get("TeamId")
                     break
-            if player_team_id:
+            if tid:
                 break
 
-    if not player_team_id:
-        LOG.warning("TeamID 取得不可。match=%s", _trunc(match_data, 500))
+    if not tid:
+        LOG.warning("TeamID 取得不可")
         return None
 
-    # Convention: Blue=Defense, Red=Attack
-    side = "Defense" if player_team_id == "Blue" else "Attack" if player_team_id == "Red" else None
-
-    if side is None:
-        LOG.warning("未知の TeamID: '%s'", player_team_id)
-        return None
-
-    LOG.info("side: AllyTeam=%s → %s", player_team_id, side)
+    side = "Defense" if tid == "Blue" else "Attack" if tid == "Red" else None
+    if side:
+        LOG.info("side: %s → %s", tid, side)
     return side
 
 
 # ===================================================================
-# Saboteur
+# Saboteur v4 — 味方に届く妨害
 # ===================================================================
 
-def _cpu_burn_worker(stop_event: threading.Event):
-    while not stop_event.is_set():
-        _ = sum(i * 1.0001 for i in range(10000))
-
-
-def _lower_valorant_priority():
-    if platform.system() != "Windows":
-        return
-    try:
-        subprocess.run(
-            ["wmic", "process", "where",
-             'name="VALORANT-Win64-Shipping.exe"',
-             "call", "setpriority", "64"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception:
-        pass
-
-
-def _restore_valorant_priority():
-    if platform.system() != "Windows":
-        return
-    try:
-        subprocess.run(
-            ["wmic", "process", "where",
-             'name="VALORANT-Win64-Shipping.exe"',
-             "call", "setpriority", "32"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception:
-        pass
-
-
-def _api_flood_worker(base_url: str, headers: dict, stop_event: threading.Event):
-    endpoints = ["/chat/v4/presences", "/chat/v4/friendrequests"]
-    idx = 0
-    ctx = _ssl_ctx()
-    while not stop_event.is_set():
-        try:
-            path = endpoints[idx % len(endpoints)]
-            idx += 1
-            req = urllib.request.Request(f"{base_url}{path}", method="GET")
-            for k, v in headers.items():
-                req.add_header(k, v)
-            urllib.request.urlopen(req, timeout=1.0, context=ctx)
-        except Exception:
-            pass
+# チャット爆撃用メッセージ（連投でラグを誘発）
+_SPAM_MESSAGES = [
+    "\u2800" * 200,           # 空白文字200連打（ゼロ幅）
+    "\u3164" * 200,           # ハングルフィラー
+    "\U0001f4a9" * 50,        # 💩 x50
+    "\U0001f389" * 50,        # 🎉 x50
+    "\U0001f525" * 50,        # 🔥 x50
+    "\U0001f480" * 50,        # 💀 x50
+    "\u2588" * 200,           # █ ブロック文字 x200
+    "\n" * 10 + " " + "\n" * 10,  # 改行爆弾
+]
 
 
 class Saboteur:
-    def __init__(self, api: ValoAPI, duration: float = 25.0,
-                 cpu_workers: Optional[int] = None):
+    """味方のクライアントに負荷をかける妨害エンジン。
+
+    自分への影響を最小限にしつつ、以下の方法で味方を追い出す:
+    1. プリゲームチャット爆撃（ローカルAPI経由＝banリスクほぼゼロ）
+    2. エージェント高速切り替え（通常操作の範囲内）
+    """
+
+    def __init__(self, api: ValoAPI, match_id: str,
+                 duration: float = 25.0, chat_rps: float = 10.0):
         self._api = api
+        self._match_id = match_id
         self._duration = duration
-        self._cpu_workers = cpu_workers or max(1, multiprocessing.cpu_count())
+        self._chat_rps = chat_rps  # 1秒あたりのチャット送信数
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
         self._active = False
@@ -417,21 +400,18 @@ class Saboteur:
             return
         self._active = True
         self._stop_event.clear()
-        _lower_valorant_priority()
-        for _ in range(self._cpu_workers):
-            t = threading.Thread(target=_cpu_burn_worker,
-                                 args=(self._stop_event,), daemon=True)
-            t.start()
-            self._threads.append(t)
-        for _ in range(2):
-            t = threading.Thread(
-                target=_api_flood_worker,
-                args=(self._api.glz_base, self._api._game_headers(), self._stop_event),
-                daemon=True,
-            )
-            t.start()
-            self._threads.append(t)
-        LOG.info("sabotage started (%d cpu, %.1fs)", self._cpu_workers, self._duration)
+
+        # スレッド1: チャット爆撃
+        t1 = threading.Thread(target=self._chat_flood, daemon=True)
+        t1.start()
+        self._threads.append(t1)
+
+        # スレッド2: エージェント高速切替
+        t2 = threading.Thread(target=self._agent_cycle, daemon=True)
+        t2.start()
+        self._threads.append(t2)
+
+        LOG.info("sabotage v4 started (chat+agent, %.1fs)", self._duration)
 
     def stop(self):
         if not self._active:
@@ -439,10 +419,50 @@ class Saboteur:
         self._active = False
         self._stop_event.set()
         for t in self._threads:
-            t.join(timeout=2.0)
+            t.join(timeout=3.0)
         self._threads.clear()
-        _restore_valorant_priority()
         LOG.info("sabotage stopped")
+
+    def _chat_flood(self):
+        """プリゲームチャットに高速でメッセージを送りつける。"""
+        cid = self._api.get_pregame_cid()
+        if not cid:
+            LOG.warning("chat flood: cid 取得不可")
+            return
+
+        LOG.info("chat flood: cid=%s rps=%.0f", cid, self._chat_rps)
+        interval = 1.0 / max(self._chat_rps, 1.0)
+        count = 0
+
+        while not self._stop_event.is_set():
+            msg = random.choice(_SPAM_MESSAGES)
+            try:
+                ok = self._api.send_chat(cid, msg)
+                if ok:
+                    count += 1
+            except Exception:
+                pass
+            time.sleep(interval)
+
+        LOG.info("chat flood: %d messages sent", count)
+
+    def _agent_cycle(self):
+        """エージェントを高速で切り替え続ける。"""
+        agents = self._api.get_agents()
+        if not agents:
+            LOG.warning("agent cycle: エージェントリスト取得不可")
+            return
+
+        interval = 0.15  # 150ms 間隔で切り替え
+        idx = 0
+        while not self._stop_event.is_set():
+            agent = agents[idx % len(agents)]
+            idx += 1
+            try:
+                self._api.select_agent(self._match_id, agent)
+            except Exception:
+                pass
+            time.sleep(interval)
 
     @property
     def duration(self) -> float:
@@ -454,11 +474,15 @@ class Saboteur:
 # ===================================================================
 
 class DodgerMonitor:
-    MODES = {"dodge": "即ドッジ", "sabotage": "妨害のみ", "combo": "妨害→最終ドッジ"}
+    MODES = {
+        "dodge": "即ドッジ（非推奨）",
+        "sabotage": "チャット爆撃＋エージェント切替（自分は抜けない）",
+        "combo": "妨害 → 最終ドッジ",
+    }
 
     def __init__(self, api: ValoAPI, dodge_side: str = "Attack",
                  interval: float = 2.0, dry_run: bool = False,
-                 mode: str = "dodge", sabotage_duration: float = 25.0):
+                 mode: str = "sabotage", sabotage_duration: float = 25.0):
         self.api = api
         self.dodge_side = dodge_side.capitalize()
         self.interval = interval
@@ -474,18 +498,17 @@ class DodgerMonitor:
 
     def _on_signal(self, signum, frame):
         self._running = False
-        self._cleanup_saboteur()
+        self._cleanup()
 
-    def _cleanup_saboteur(self):
+    def _cleanup(self):
         if self._saboteur:
             self._saboteur.stop()
             self._saboteur = None
 
     def run(self):
         print("=" * 55)
-        print("  Valo Dodger v3")
+        print("  Valo Dodger v4")
         print(f"  GLZ:  {self.api.glz_base}")
-        print(f"  PUUID: {self.api.puuid[:16]}...")
         print(f"  回避: {self.dodge_side} スタート")
         print(f"  モード: {self.MODES.get(self.mode, self.mode)}")
         if self.dry_run:
@@ -499,12 +522,12 @@ class DodgerMonitor:
             except ConnectionError:
                 self._tick_count += 1
                 if self._tick_count == 1 or self._tick_count % 15 == 0:
-                    LOG.debug("接続待機 (tick=%d)", self._tick_count)
+                    LOG.debug("待機中 (tick=%d)", self._tick_count)
             except Exception:
                 LOG.exception("tick error")
             self._sleep(self.interval)
 
-        self._cleanup_saboteur()
+        self._cleanup()
         print("\n終了。")
 
     def _tick(self):
@@ -512,7 +535,7 @@ class DodgerMonitor:
         player = self.api.get_pregame_player()
         if player is None:
             self._last_match_id = None
-            self._cleanup_saboteur()
+            self._cleanup()
             return
 
         match_id = player.get("MatchID") or player.get("MatchId")
@@ -522,8 +545,7 @@ class DodgerMonitor:
 
         side = detect_player_side(self.api, player)
         if side is None:
-            print("\n⚠ サイド判定不可 → レスポンス確認:")
-            print(f"   player: {_trunc(player, 500)}")
+            print("\n⚠ サイド判定不可")
             return
 
         print(f"\n🎯 マッチ検出 | {match_id[:12]}... | サイド: **{side}**")
@@ -546,7 +568,7 @@ class DodgerMonitor:
         if self.dry_run:
             print(f"   [DRY RUN] {side} → skip")
             return
-        print(f"   ❌ {side} → ドッジ...")
+        print(f"   ⚠ {side} → ドッジ（非推奨。ペナルティ/検知リスクあり）")
         ok = self.api.quit_pregame(match_id)
         print("   ✅ 成功" if ok else "   ❌ 失敗")
 
@@ -554,13 +576,20 @@ class DodgerMonitor:
         if self.dry_run:
             print(f"   [DRY RUN] {side} → skip")
             return
-        print(f"   💀 {side} → 妨害開始 ({self.sabotage_duration}s)")
-        self._saboteur = Saboteur(self.api, self.sabotage_duration)
+        print(f"   💀 {side} → チャット爆撃＋エージェント切替開始")
+        print(f"   🔥 味方クライアントに負荷送信中 ({self.sabotage_duration}s)...")
+        print(f"   👀 誰かが抜けるのを待ちます")
+
+        self._saboteur = Saboteur(self.api, match_id, self.sabotage_duration)
         self._saboteur.start()
+
         deadline = time.monotonic() + self.sabotage_duration
         while self._running and time.monotonic() < deadline:
-            time.sleep(0.5)
-        self._cleanup_saboteur()
+            time.sleep(1.0)
+            if self.api.get_pregame_player() is None:
+                break
+
+        self._cleanup()
         still_in = self.api.get_pregame_player()
         print("   🎉 誰かが抜けた！" if still_in is None else "   😐 誰も抜けず...")
 
@@ -568,9 +597,12 @@ class DodgerMonitor:
         if self.dry_run:
             print(f"   [DRY RUN] {side} → skip")
             return
-        print(f"   💀 {side} → コンボ ({self.sabotage_duration}s)")
-        self._saboteur = Saboteur(self.api, self.sabotage_duration)
+        print(f"   💀 {side} → コンボ（妨害 → 最終ドッジ）")
+        print(f"   🔥 チャット爆撃＋エージェント切替 ({self.sabotage_duration}s)...")
+
+        self._saboteur = Saboteur(self.api, match_id, self.sabotage_duration)
         self._saboteur.start()
+
         deadline = time.monotonic() + self.sabotage_duration
         dodged = False
         while self._running and time.monotonic() < deadline:
@@ -578,11 +610,13 @@ class DodgerMonitor:
             if self.api.get_pregame_player() is None:
                 dodged = True
                 break
-        self._cleanup_saboteur()
+
+        self._cleanup()
+
         if dodged:
             print("   🎉 誰かが抜けた！")
         else:
-            print("   ❌ 最終ドッジ...")
+            print("   ⚠ 最終手段: ドッジします（ペナルティ/検知リスクあり）...")
             ok = self.api.quit_pregame(match_id)
             print("   ✅" if ok else "   ❌ 失敗")
 
@@ -597,9 +631,10 @@ class DodgerMonitor:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Valorant Auto-Dodger v3")
+    parser = argparse.ArgumentParser(description="Valorant Auto-Dodger v4")
     parser.add_argument("--mode", choices=["dodge", "sabotage", "combo"],
-                        default="dodge")
+                        default="sabotage",
+                        help="sabotage=妨害のみ(安全), combo=妨害→最終ドッジ, dodge=即ドッジ(非推奨)")
     parser.add_argument("--dodge", choices=["attack", "defense"], default="attack")
     parser.add_argument("--sabotage-duration", type=float, default=25.0)
     parser.add_argument("--lockfile", type=Path, default=None)
@@ -614,19 +649,17 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    # 1. lockfile
     lf = args.lockfile or lockfile_path()
     if not lf.exists():
-        print(f"❌ lockfile が見つかりません: {lf}\nValorant 起動してますか？", file=sys.stderr)
+        print(f"❌ lockfile なし: {lf}", file=sys.stderr)
         sys.exit(1)
     try:
         parts = lf.read_text().strip().split(":")
         port, password = int(parts[2]), parts[3]
     except Exception as e:
-        print(f"❌ lockfile 読み取り失敗: {e}", file=sys.stderr)
+        print(f"❌ lockfile 読取失敗: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # 2. connect
     api = ValoAPI(port, password)
     try:
         api.connect()
