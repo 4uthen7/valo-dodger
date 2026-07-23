@@ -1,0 +1,90 @@
+====================================================
+  Valo Dodger v3 - 使い方 (Windows)
+====================================================
+
+【v3 変更点】
+  - 毎回トークンをリフレッシュ（403/1010エラー対策）
+  - region/shard 検出に riot-geo API を追加
+    （ShooterGame.logから取れなくても動く）
+  - 動的プラットフォームヘッダー生成
+  - --verbose で全API通信の中身が見れる
+
+【1】必要なもの
+  - Windows PC（Valorantが動いているマシン）
+  - Python 3.9+
+    https://www.python.org/downloads/ からDL
+    「Add Python to PATH」に必ずチェック
+
+【2】起動
+  Valorantを起動した状態でコマンドプロンプトを開く：
+
+    cd C:\Users\ユーザー名\Desktop\valo
+
+  【まずはコレ】動作確認（ドライラン + 詳細ログ）：
+    python valo_dodger.py --dry-run --verbose
+
+  【本番】即ドッジ：
+    python valo_dodger.py
+
+  【本番】妨害→最終ドッジ：
+    python valo_dodger.py --mode combo
+
+  【本番】妨害のみ：
+    python valo_dodger.py --mode sabotage
+
+  ダブルクリック起動：
+    valo_dodger.bat をダブルクリック
+
+【3】起動時にこう表示されればOK
+  =======================================================
+    Valo Dodger v3
+    GLZ:  https://glz-ap-1.jp.a.pvp.net
+    PUUID: xxxxxxxx-xxxx-...
+    回避: Attack スタート
+    モード: 即ドッジ
+    間隔: 2.0s
+  =======================================================
+
+  GLZのURLが出てれば接続成功。
+  そのままマッチング → エージェント選択に入ると
+  「🎯 マッチ検出 | サイド: Attack」と表示される。
+
+【4】403/1010 エラーが出た場合
+  v3では毎回トークンをリフレッシュするので
+  基本的に出なくなるはず。
+  それでも出る場合は --verbose でログを見て
+  どのAPIでコケてるか確認してください。
+
+【5】止め方
+  Ctrl+C
+
+【6】トラブルシューティング
+
+   「lockfile が見つかりません」
+     → Valorantを起動してから実行
+     → Riot Clientをタスクバーから一旦終了→再起動
+
+   「トークン取得失敗」
+     → Riot Clientを再起動
+     → lockfileのパスワードが変わってる可能性
+
+   「GLZ base が null や unknown」
+     → ShooterGame.logが無い/空
+     → v3ではriot-geo APIに自動フォールバックするので
+       普通は動くはず
+
+   「サイド判定不可」
+     → --verbose でAPIレスポンスを確認
+     → TeamsフィールドやTeamIDの形式が
+       パッチで変わった可能性
+
+   「ドッジ失敗」
+     → --verbose でHTTPステータス確認
+     → ペナルティでドッジ制限中かも
+
+【7】モード一覧
+
+   dodge    = 攻め検出 → 即ドッジ
+   sabotage = 攻め検出 → CPU飽和 + API flood
+              味方が抜けるのを待つ（自分にペナなし）
+   combo    = 妨害 → 誰も抜けなければ最終ドッジ
