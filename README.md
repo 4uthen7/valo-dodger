@@ -4,6 +4,7 @@
 
 Valorant の local + GLZ API を使って pregame (agent select) 入室を検知し、Attack スタート（＝守りスタート以外）だった場合に自動で対処する Python スクリプト。
 
+- **clip（デフォルト）** — 攻めスタート時、クリップボードの文章をエージェントピックのチャットに数秒おきに送り続ける（エージェントは放置・自分にペナルティなし）
 - **sabotage** — チャット送信 + エージェント切替で味方にドッジさせる（自分は抜けない → 自分にペナルティなし）
 - **combo** — 妨害 → 誰も抜けなければ最終ドッジ
 - **dodge** — 攻め検出で即ドッジ（⚠ ペナルティあり）
@@ -40,9 +41,13 @@ Valorant の local + GLZ API を使って pregame (agent select) 入室を検知
 ```bat
 cd C:\path\to\valo-dodger
 python valo_dodger.py --dry-run --verbose   # 動作確認
-python valo_dodger.py                        # 妨害のみ（デフォルト・自分にペナなし）
+python valo_dodger.py                        # クリップボード送信（デフォルト・エージェント放置）
+python valo_dodger.py --mode sabotage        # 妨害（チャット+エージェント切替）
 python valo_dodger.py --mode combo           # 妨害→最終ドッジ
 python valo_dodger.py --mode dodge           # 即ドッジ（ペナルティ注意）
+
+クリップボードモードの使い方: 送りたい文章（例: `dodge pls`）をコピーしておくだけ。
+攻めスタートを検出すると、その文章をチャットに自動送信し続けます。
 ```
 
 `valo_dodger.bat` をダブルクリックでも起動可。
@@ -62,7 +67,8 @@ ShooterGame.log or riot-geo API → region + shard + client_version
                                          ↓ (2秒ポーリング)
                      pregame 検出 → サイド判定 (Blue=守り / Red=攻め)
                                          ↓
-        Attack → sabotage: 味方にドッジさせる（自分にペナなし）
+        Attack → clip: クリップボードの文章をチャットに送り続ける（エージェント放置）
+               → sabotage: 味方にドッジさせる（自分にペナなし）
                → combo: 妨害 → 誰も抜けなければ最終ドッジ
                → dodge: POST /pregame/v1/matches/{id}/quit
                                          ↓
@@ -72,9 +78,10 @@ ShooterGame.log or riot-geo API → region + shard + client_version
 ## Options
 
 ```
---mode {sabotage,combo,dodge}  モード選択 (default: sabotage)
+--mode {clip,sabotage,combo,dodge}  モード選択 (default: clip)
 --dodge {attack,defense}       ドッジ対象サイド (default: attack = 守り以外を流す)
 --sabotage-duration SECONDS    妨害時間 (default: 30)
+--chat-interval SECONDS        clipモードの送信間隔 (default: 5)
 --max-dodges-per-day N         24h以内の自ドッジ上限 (default: 2)
 --once                         1回処理したら終了
 --status                       ドッジせず、アカウントのペナルティ/キュー/履歴を表示して終了

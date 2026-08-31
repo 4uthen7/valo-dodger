@@ -3,6 +3,11 @@
 Valorant Auto-Dodger v6 — ペナルティ対応版
 ==========================================
 
+v6.2 からの変更:
+- 新モード clip (デフォルト): 攻めスタート時に、クリップボードの文章を
+  エージェントピック画面のチャットへ数秒おきに送り続ける（エージェント切替なし）
+- 起動したら常駐し、攻めスタートのマッチを検出するたびに自動送信
+
 v5 からの変更:
 - サイド判定を確定: Blue=Defender / Red=Attacker
   (エージェント選択画面の pregame API で初回ハーフのサイドが確定して取得できる。
@@ -27,9 +32,11 @@ v5 からの変更:
 - エージェントをロックせず時間切れでも「ドッジ」扱いでペナルティが来る (AFK扱い)
 
 usage:
-  python valo_dodger.py                         # 妨害のみ (デフォルト・自分にペナなし)
+  python valo_dodger.py                         # クリップボード送信 (デフォルト・エージェント放置)
+  python valo_dodger.py --mode sabotage         # 妨害 (チャット+エージェント切替)
   python valo_dodger.py --mode combo            # 妨害→最終ドッジ (ペナルティ警告あり)
   python valo_dodger.py --mode dodge            # 即ドッジ (ペナルティ・RR減注意)
+  python valo_dodger.py --status                # アカウント状態を表示して終了
   python valo_dodger.py --dry-run -v            # 動作確認
 """
 
@@ -52,6 +59,14 @@ from pathlib import Path
 from typing import Optional, Union
 
 LOG = logging.getLogger("valo-dodger")
+
+# コンソールの文字コードに依存せずクラッシュしないようにする (bat は chcp 65001 推奨)
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+del _stream
 
 # ---------------------------------------------------------------------------
 # リスク警告
@@ -492,6 +507,104 @@ _SPAM_POOL = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# クリップボード送信 (clip モード)
+# ---------------------------------------------------------------------------
+
+
+def read_clipboard_text() -> Optional[str]:
+    """Windows クリップボードのテキストを読む (標準ライブラリのみ / ctypes)。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+    except Exception:
+        return None
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    CF_UNICODETEXT = 13
+    if not user32.OpenClipboard(None):
+        return None
+    try:
+        if not user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return None
+        h = user32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return None
+        p = kernel32.GlobalLock(h)
+        if not p:
+            return None
+        try:
+            size = int(kernel32.GlobalSize(h))
+            raw = ctypes.string_at(p, size)
+            return raw.decode("utf-16-le", errors="replace").rstrip("\x00").strip()
+        finally:
+            kernel32.GlobalUnlock(h)
+    finally:
+        user32.CloseClipboard()
+
+
+class ClipboardSpammer:
+    """エージェント選択画面のチャットにクリップボードの文章を送り続ける。
+    エージェント切替はしない（放置）。pregame が終わるまで無限に送る。"""
+
+    def __init__(self, api: ValoAPI, interval: float = 5.0):
+        self._api = api
+        self._interval = interval
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._active = False
+        self._sent = 0
+
+    def start(self):
+        if self._active:
+            return
+        self._active = True
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        LOG.info("clipboard spam started (interval=%.1fs)", self._interval)
+
+    def stop(self):
+        if not self._active:
+            return
+        self._active = False
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=3.0)
+            self._thread = None
+        LOG.info("clipboard spam stopped (%d sent)", self._sent)
+
+    def _loop(self):
+        warned_cid = False
+        warned_clip = False
+        while not self._stop_event.is_set():
+            cid = self._api.get_pregame_cid()
+            if not cid:
+                if not warned_cid:
+                    print("   ⚠ チャットに接続できません（再試行します）")
+                    warned_cid = True
+                self._stop_event.wait(2.0)
+                continue
+            text = read_clipboard_text()
+            if not text:
+                if not warned_clip:
+                    print("   ⚠ クリップボードにテキストがありません")
+                    print("      ※ 送信したい文章をコピーしておくと、その内容を自動送信します")
+                    warned_clip = True
+                self._stop_event.wait(self._interval)
+                continue
+            try:
+                ok = self._api.send_chat(cid, text[:400])
+                if ok:
+                    self._sent += 1
+                    if self._sent <= 3 or self._sent % 10 == 0:
+                        print(f"   📋 {self._sent} 回目: {text[:30]}")
+            except Exception:
+                pass
+            self._stop_event.wait(self._interval)
+
+
 class Saboteur:
     """ロビーを妨害して味方にドッジさせる（ドッジした側にペナルティが付く）。
 
@@ -580,6 +693,7 @@ class Saboteur:
 
 class DodgerMonitor:
     MODES = {
+        "clip": "クリップボードの文章をチャットに送り続ける（エージェント放置・自分にペナなし）",
         "sabotage": "妨害のみ（味方にドッジさせる。自分にペナルティなし）",
         "combo": "妨害 → 最終ドッジ（ペナルティ警告あり）",
         "dodge": "即ドッジ（⚠ キュー制限 + コンペでは隠しRR減）",
@@ -587,7 +701,8 @@ class DodgerMonitor:
 
     def __init__(self, api: ValoAPI, dodge_side: str = "Attack",
                  interval: float = 2.0, dry_run: bool = False,
-                 mode: str = "sabotage", sabotage_duration: float = 30.0,
+                 mode: str = "clip", sabotage_duration: float = 30.0,
+                 chat_interval: float = 5.0,
                  max_dodges_per_day: int = 2, once: bool = False):
         self.api = api
         self.dodge_side = dodge_side.capitalize()
@@ -595,12 +710,14 @@ class DodgerMonitor:
         self.dry_run = dry_run
         self.mode = mode
         self.sabotage_duration = sabotage_duration
+        self.chat_interval = chat_interval
         self.max_dodges_per_day = max_dodges_per_day
         self.once = once
         self.state = load_state()
         self._running = True
         self._last_match_id: Optional[str] = None
         self._saboteur: Optional[Saboteur] = None
+        self._spammer: Optional[ClipboardSpammer] = None
         self._tick_count = 0
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -613,6 +730,44 @@ class DodgerMonitor:
         if self._saboteur:
             self._saboteur.stop()
             self._saboteur = None
+        if self._spammer:
+            self._spammer.stop()
+            self._spammer = None
+
+    def __init__(self, api: ValoAPI, dodge_side: str = "Attack",
+                 interval: float = 2.0, dry_run: bool = False,
+                 mode: str = "clip", sabotage_duration: float = 30.0,
+                 chat_interval: float = 5.0,
+                 max_dodges_per_day: int = 2, once: bool = False):
+        self.api = api
+        self.dodge_side = dodge_side.capitalize()
+        self.interval = interval
+        self.dry_run = dry_run
+        self.mode = mode
+        self.sabotage_duration = sabotage_duration
+        self.chat_interval = chat_interval
+        self.max_dodges_per_day = max_dodges_per_day
+        self.once = once
+        self.state = load_state()
+        self._running = True
+        self._last_match_id: Optional[str] = None
+        self._saboteur: Optional[Saboteur] = None
+        self._spammer: Optional[ClipboardSpammer] = None
+        self._tick_count = 0
+        signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGTERM, self._on_signal)
+
+    def _on_signal(self, signum, frame):
+        self._running = False
+        self._cleanup()
+
+    def _cleanup(self):
+        if self._saboteur:
+            self._saboteur.stop()
+            self._saboteur = None
+        if self._spammer:
+            self._spammer.stop()
+            self._spammer = None
 
     def run(self):
         recent = dodges_in_window(self.state, DODGE_WINDOW_H * 3600)
@@ -687,6 +842,8 @@ class DodgerMonitor:
             return self._do_dodge(ctx, final=False)
         if self.mode == "sabotage":
             return self._do_sabotage(ctx)
+        if self.mode == "clip":
+            return self._do_clip(ctx)
         return self._do_combo(ctx)
 
     # -- ドッジ (自分で抜ける) --
@@ -777,6 +934,31 @@ class DodgerMonitor:
         print(f"      フェーズ残り約 {max(0, int(phase_s))} 秒。放置すると時間切れ=ドッジ扱いになります。")
         print("      自分でロックしてプレイするか、Ctrl+C で停止して combo モードを検討してください。")
         return False
+
+    # -- クリップボード送信 (エージェントは放置) --
+
+    def _do_clip(self, ctx) -> bool:
+        if self.dry_run:
+            print(f"   [DRY RUN] {ctx['side']} → clip skip")
+            return False
+        print(f"   📋 {ctx['side']} → クリップボード送信開始（{self.chat_interval}秒間隔・エージェント放置）")
+        print("      味方に抜けてもらうまで送り続けます。Ctrl+C で停止。")
+        self._spammer = ClipboardSpammer(self.api, self.chat_interval)
+        self._spammer.start()
+        try:
+            while self._running:
+                time.sleep(1.5)
+                if self.api.session_state() != "pregame":
+                    break
+        finally:
+            self._spammer.stop()
+            self._spammer = None
+        state = self.api.session_state()
+        if state == "menus":
+            print("   🎉 ロビーが解散しました（誰かが抜けた or キャンセル）。次のマッチを監視します")
+        elif state == "ingame":
+            print("   ⚠ 試合が始まりました。送信を停止します")
+        return True
 
     # -- コンボ: 妨害 → 最終ドッジ --
 
@@ -1003,13 +1185,15 @@ def print_status(api: ValoAPI) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Valorant Auto-Dodger v6")
-    parser.add_argument("--mode", choices=["sabotage", "combo", "dodge"],
-                        default="sabotage",
-                        help="sabotage=妨害のみ(自分にペナなし/デフォルト), combo=妨害→最終ドッジ, dodge=即ドッジ(ペナルティ注意)")
+    parser.add_argument("--mode", choices=["clip", "sabotage", "combo", "dodge"],
+                        default="clip",
+                        help="clip=クリップボード送信(デフォルト), sabotage=妨害, combo=妨害→最終ドッジ, dodge=即ドッジ(ペナルティ注意)")
     parser.add_argument("--dodge", choices=["attack", "defense"], default="attack",
                         help="このサイドでスタートしたらドッジ対象にする (default: attack = 守り以外を流す)")
     parser.add_argument("--sabotage-duration", type=float, default=30.0,
                         help="妨害時間 (秒)。エージェント選択フェーズより短く (default: 30)")
+    parser.add_argument("--chat-interval", type=float, default=5.0,
+                        help="クリップボード送信の間隔 (秒) (default: 5)")
     parser.add_argument("--max-dodges-per-day", type=int, default=2,
                         help="24時間以内に自分でドッジする上限 (default: 2)。超過時は妨害のみ")
     parser.add_argument("--once", action="store_true",
@@ -1021,13 +1205,6 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
-
-    # コンソールの文字コードに依存せずクラッシュしないようにする (bat は chcp 65001 推奨)
-    for _s in (sys.stdout, sys.stderr):
-        try:
-            _s.reconfigure(errors="replace")
-        except Exception:
-            pass
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1066,6 +1243,7 @@ def main():
         dodge_side="Attack" if args.dodge == "attack" else "Defense",
         interval=args.interval, dry_run=args.dry_run, mode=args.mode,
         sabotage_duration=args.sabotage_duration,
+        chat_interval=args.chat_interval,
         max_dodges_per_day=args.max_dodges_per_day,
         once=args.once,
     )
