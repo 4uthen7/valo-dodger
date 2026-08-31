@@ -358,6 +358,36 @@ class ValoAPI:
             "eligible_queues": party.get("EligibleQueues") or [],
         }
 
+    # -- pd (アカウント情報) --
+
+    def get_penalties(self) -> Optional[dict]:
+        """アカウントのペナルティ一覧 (restrictions/v3/penalties)。
+        構造は非公開のため、呼び出し側で防御的にパースする。"""
+        status, data = self.pd_get("/restrictions/v3/penalties")
+        if status != 200 or not isinstance(data, dict):
+            LOG.warning("penalties HTTP %s", status)
+            return None
+        return data
+
+    def get_mmr(self) -> Optional[dict]:
+        """現在のランク/RR と直近のレーティング変動。"""
+        status, data = self.pd_get(f"/mmr/v1/players/{self._puuid}")
+        if status != 200 or not isinstance(data, dict):
+            return None
+        return data
+
+    def get_competitive_updates(self, limit: int = 10) -> list:
+        """直近の競技アップデート。AFKPenalty フィールドでペナルティを検出できる。"""
+        status, data = self.pd_get(
+            f"/mmr/v1/players/{self._puuid}/competitiveupdates"
+            f"?startIndex=0&endIndex={limit}"
+            + "&queue=competitive"
+        )
+        if status != 200 or not isinstance(data, dict):
+            return []
+        matches = data.get("Matches") or []
+        return [m for m in matches if isinstance(m, dict)]
+
     # -- chat --
 
     def get_pregame_cid(self) -> Optional[str]:
@@ -782,6 +812,190 @@ class DodgerMonitor:
         while self._running and time.monotonic() < end:
             time.sleep(min(0.25, end - time.monotonic()))
 
+# ---------------------------------------------------------------------------
+# アカウントステータス表示 (--status)
+# ---------------------------------------------------------------------------
+
+_TIER_NAMES = {
+    0: "Unranked",
+    3: "Iron 1", 4: "Iron 2", 5: "Iron 3",
+    6: "Bronze 1", 7: "Bronze 2", 8: "Bronze 3",
+    9: "Silver 1", 10: "Silver 2", 11: "Silver 3",
+    12: "Gold 1", 13: "Gold 2", 14: "Gold 3",
+    15: "Platinum 1", 16: "Platinum 2", 17: "Platinum 3",
+    18: "Diamond 1", 19: "Diamond 2", 20: "Diamond 3",
+    21: "Ascendant 1", 22: "Ascendant 2", 23: "Ascendant 3",
+    24: "Immortal 1", 25: "Immortal 2", 26: "Immortal 3",
+    27: "Radiant",
+}
+
+
+def _tier_name(tier: int) -> str:
+    return _TIER_NAMES.get(tier, f"Tier {tier}")
+
+
+def _fmt_dt(ts) -> str:
+    """epoch ms → ローカル時刻文字列。"""
+    try:
+        return time.strftime("%m/%d %H:%M", time.localtime(ts / 1000))
+    except Exception:
+        return str(ts)
+
+
+def _fmt_restriction(sec: int) -> str:
+    sec = int(sec or 0)
+    if sec <= 0:
+        return "なし"
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}時間{m}分"
+    if m:
+        return f"{m}分{s}秒"
+    return f"{s}秒"
+
+
+def print_status(api: ValoAPI) -> None:
+    state = load_state()
+    print("=" * 58)
+    print("  Valo Dodger v6 — アカウントステータス")
+    print(f"  GLZ:  {api.glz_base}")
+    print("=" * 58)
+
+    # ---- 1. キュー可否 ----
+    print("\n【キュー可否】")
+    try:
+        info = api.get_party_restriction()
+    except Exception:
+        info = None
+    if not info:
+        print("  - 取得できませんでした (ゲーム/クライアント起動中か確認)")
+    else:
+        sec = int(info.get("restricted_seconds") or 0)
+        if sec > 0:
+            print(f"  ❌ キュー制限中: 残り {_fmt_restriction(sec)}")
+        else:
+            print("  ✅ 今すぐキュー可能")
+        inelig = info.get("queue_ineligibilities") or []
+        if inelig:
+            print(f"  - キュー不可理由: {', '.join(map(str, inelig))}")
+        eligible = info.get("eligible_queues") or []
+        if eligible:
+            print(f"  - 利用可能キュー: {', '.join(map(str, eligible))}")
+
+    # ---- 2. ランク / RR ----
+    print("\n【ランク / RR】")
+    try:
+        mmr = api.get_mmr()
+    except Exception:
+        mmr = None
+    if not mmr:
+        print("  - 取得できませんでした")
+    else:
+        best = None
+        for qid, qs in (mmr.get("QueueSkills") or {}).items():
+            if qid not in ("competitive",):
+                continue
+            for sid, s in (qs.get("SeasonalInfoBySeasonID") or {}).items():
+                if best is None or s.get("Rank") >= best.get("Rank", 0):
+                    best = s
+        if best:
+            tier = best.get("CompetitiveTier") or 0
+            rr = best.get("RankedRating") or 0
+            print(f"  - 現在: {_tier_name(tier)} ({rr} RR)")
+            wins = best.get("NumberOfWins") or 0
+            games = best.get("NumberOfGames") or 0
+            print(f"  - 今シーズン: {wins}勝 {max(0, games - wins)}敗")
+        latest = mmr.get("LatestCompetitiveUpdate")
+        if latest:
+            earned = latest.get("RankedRatingEarned") or 0
+            afk = latest.get("AFKPenalty") or 0
+            if afk:
+                print(f"  - 直近変動: {earned:+d} RR (AFKペナルティ {afk})")
+            else:
+                print(f"  - 直近変動: {earned:+d} RR")
+
+    # ---- 3. 直近の競技アップデート ----
+    print("\n【直近の競技アップデート (AFK/ペナルティ検出)】")
+    try:
+        updates = api.get_competitive_updates(10)
+    except Exception:
+        updates = []
+    if not updates:
+        print("  - 履歴なし")
+    else:
+        for m in updates[:10]:
+            earned = m.get("RankedRatingEarned") or 0
+            afk = m.get("AFKPenalty") or 0
+            flag = "  ⚠ AFK/ペナルティ" if afk else ""
+            before = _tier_name(m.get("TierBeforeUpdate") or 0)
+            after = _tier_name(m.get("TierAfterUpdate") or 0)
+            print(f"  {_fmt_dt(m.get('MatchStartTime') or 0)} | {before} → {after} | {earned:+d} RR{flag}")
+
+    # ---- 4. ペナルティ一覧 ----
+    print("\n【アカウントのペナルティ (restrictions/v3/penalties)】")
+    try:
+        pen = api.get_penalties()
+    except Exception:
+        pen = None
+    if not pen:
+        print("  - 取得できませんでした (HTTPエラーか、エンドポイントが非対応の可能性)")
+    else:
+        plist = pen.get("Penalties") or []
+        if not plist:
+            print("  - ペナルティなし")
+        else:
+            for p in plist:
+                if not isinstance(p, dict):
+                    print(f"  - {p}")
+                    continue
+                ptype = p.get("Type") or p.get("type") or "?"
+                secs = p.get("RestrictedSeconds") or p.get("restrictedSeconds") or 0
+                start = p.get("StartDate") or p.get("RenderedStartDate") or ""
+                print(f"  - {ptype} | 残り {_fmt_restriction(secs)} | {start}")
+                unknown = {k: v for k, v in p.items()
+                           if k not in ("Type", "type", "RestrictedSeconds",
+                                        "restrictedSeconds", "StartDate",
+                                        "RenderedStartDate")}
+                if unknown:
+                    LOG.debug("penalty fields: %s", json.dumps(unknown, ensure_ascii=False))
+
+    # ---- 5. 自ドッジ履歴 ----
+    dodges = state.get("dodges") or []
+    now = time.time()
+    n24 = len([t for t in dodges if now - t < DODGE_WINDOW_H * 3600])
+    today = time.localtime()
+    today0 = time.mktime((today.tm_year, today.tm_mon, today.tm_mday, 0, 0, 0, 0, 0, -1))
+    n_today = len([t for t in dodges if t >= today0])
+    print("\n【自ドッジ履歴 (valo_dodger_state.json)】")
+    print(f"  - 24h以内: {n24} 回 / 上限 2 回 (--max-dodges-per-day で変更)")
+    print(f"  - 今日: {n_today} 回 / 累計: {len(dodges)} 回")
+    if dodges:
+        last = dodges[-1]
+        ago = (now - last) / 3600
+        if ago < 1:
+            print(f"  - 最後のドッジ: {int(ago * 60)} 分前")
+        else:
+            print(f"  - 最後のドッジ: {ago:.1f} 時間前")
+        recent = dodges[-5:]
+        stamps = ", ".join(time.strftime("%m/%d %H:%M", time.localtime(t)) for t in recent)
+        print(f"  - 直近5回: {stamps}")
+
+    # ---- 6. RR減リスクの目安 ----
+    print("\n【RR減リスクの目安】")
+    recent_afk = any(m.get("AFKPenalty") for m in updates)
+    if recent_afk:
+        print("  ⚠ 直近の競技アップデートに AFK/ペナルティが検出されています")
+        print("    → 次のドッジは RR 減 (4〜12) が適用される可能性が高い")
+    elif n24 == 0:
+        print("  - 24h以内ドッジなし: 初回ドッジはキュー制限のみの可能性が高い (RR減リスク低)")
+    elif n24 == 1:
+        print("  ⚠ 24h内 1 回目: 2 回目以降のドッジから RR 減が始まる可能性が高い")
+    else:
+        print(f"  ⚠⚠ 24h内 {n24} 回: RR 減 (4〜12) が適用されている可能性が高い")
+        print("      今日は自ドッジを避け、妨害モードで味方に流すのを推奨")
+    print("  ※ Riot は正確な閾値を公開していません。上記は公式発表 + コミュニティ情報に基づく目安です")
+    print()
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -800,11 +1014,20 @@ def main():
                         help="24時間以内に自分でドッジする上限 (default: 2)。超過時は妨害のみ")
     parser.add_argument("--once", action="store_true",
                         help="1回処理したら終了")
+    parser.add_argument("--status", action="store_true",
+                        help="ドッジせず、アカウントのペナルティ/キュー/ドッジ履歴を表示して終了")
     parser.add_argument("--lockfile", type=Path, default=None)
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
+
+    # コンソールの文字コードに依存せずクラッシュしないようにする (bat は chcp 65001 推奨)
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(errors="replace")
+        except Exception:
+            pass
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -833,6 +1056,10 @@ def main():
         sys.exit(1)
 
     print(f"✅ 接続OK | {api.glz_base}")
+
+    if args.status:
+        print_status(api)
+        sys.exit(0)
 
     monitor = DodgerMonitor(
         api=api,

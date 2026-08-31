@@ -77,6 +77,7 @@ ShooterGame.log or riot-geo API → region + shard + client_version
 --sabotage-duration SECONDS    妨害時間 (default: 30)
 --max-dodges-per-day N         24h以内の自ドッジ上限 (default: 2)
 --once                         1回処理したら終了
+--status                       ドッジせず、アカウントのペナルティ/キュー/履歴を表示して終了
 --interval SECONDS             ポーリング間隔 (default: 2)
 --dry-run                      検出のみ・回避/妨害なし
 --verbose, -v                  全 HTTP 通信ログ表示
