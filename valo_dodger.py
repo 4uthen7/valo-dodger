@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
 """
-Valorant Auto-Dodger v5 — 安全策強化版
-======================================
+Valorant Auto-Dodger v6 — ペナルティ対応版
+==========================================
 
-v4 からの変更:
-- エージェント切替に人間らしいランダム遅延 (300〜900ms)
-- チャット爆撃の頻度・内容に揺らぎ（bot判定対策）
-- ポーリング間隔にジッター（機械的パターン回避）
-- 起動時にリスク警告表示
-- GLZ quit は非推奨明示
+v5 からの変更:
+- サイド判定を確定: Blue=Defender / Red=Attacker
+  (エージェント選択画面の pregame API で初回ハーフのサイドが確定して取得できる。
+   同種ツール Fast-Pick 等と同じマッピング)
+- セッション状態判定 (pregame / ingame / menus) を追加:
+  「誰かが抜けた」「試合が始まった」「まだ誰も抜けない」を正確に区別
+- ドッジペナルティ対応:
+  * 24時間以内の自ドッジ回数を valo_dodger_state.json に記録
+  * 連続ドッジのエスカレーションを警告 (キュー制限・隠しRR減 4〜12・1日ランク制限)
+  * --max-dodges-per-day で自爆ドッジの回数を制限 (超過時は妨害のみ)
+  * ドッジ後に party API の RestrictedSeconds から残りキュー制限を表示
+- サボタージュ用エージェントUUIDの誤りを修正
 
-リスク評価:
-  Vanguard 検知     : ほぼゼロ（メモリ/DLL操作なし）
-  サーバーサイド検知 : 低〜中（GLZ APIの使用パターン次第）
-  通報              : 中（griefing通報の蓄積に注意）
-  GLZ quit         : 高（最も検知されやすい操作）
+ペナルティ調査の要点 (Riot公式 + コミュニティ情報、2025-09時点):
+- 自分でドッジすると必ずペナルティ:
+  * キュー制限 (初回は数分。連続で急増し、パッチ11.05以降は頻繁なドッジャーに急加速)
+  * コンペティティブでは隠しRR減 (標準ドッジで約6、反復で増加し 4〜12 の幅)
+  * 行動レーティングが低下 → 以後のペナルティが早く/重くなる
+  * 過度なAFK/ドッジで 1日ランク制限、継続悪質者にはゲーム禁止
+- 誰かがドッジした場合はマッチがキャンセルされ、自分はペナルティなしでロビー復帰
+  → 「味方に流させる」のが自分にペナルティを付けない唯一の方法
+- エージェントをロックせず時間切れでも「ドッジ」扱いでペナルティが来る (AFK扱い)
 
 usage:
-  python valo_dodger.py                    # 妨害のみ（デフォルト・安全）
-  python valo_dodger.py --mode combo       # 妨害→最終ドッジ
-  python valo_dodger.py --dry-run -v       # 動作確認
+  python valo_dodger.py                         # 妨害のみ (デフォルト・自分にペナなし)
+  python valo_dodger.py --mode combo            # 妨害→最終ドッジ (ペナルティ警告あり)
+  python valo_dodger.py --mode dodge            # 即ドッジ (ペナルティ・RR減注意)
+  python valo_dodger.py --dry-run -v            # 動作確認
 """
 
 import argparse
@@ -47,19 +58,52 @@ LOG = logging.getLogger("valo-dodger")
 # ---------------------------------------------------------------------------
 
 RISK_WARNING = """
-  ╔══════════════════════════════════════════════════════╗
-  ║  【重要】使用上のリスクについて                       ║
-  ║                                                      ║
-  ║  Vanguard 検知          : ほぼなし (メモリ操作なし)    ║
-  ║  サーバーサイド検知      : 低〜中 (API通信パターン次第) ║
-  ║  通報 (griefing/afk)    : 中 (味方から通報の可能性)   ║
-  ║  GLZ quit (ドッジ)      : 高 (UI経由せずAPI直叩き)    ║
-  ║                                                      ║
-  ║  デフォルトの sabotage モードは                       ║
-  ║  ゲーム内の通常操作の範囲に抑えていますが、            ║
-  ║  使用は自己責任でお願いします。                        ║
-  ╚══════════════════════════════════════════════════════╝
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  【重要】ドッジペナルティとリスクについて (2025-09調査)      ║
+  ║                                                              ║
+  ║  ・自分でドッジすると必ずペナルティが付く                    ║
+  ║     - キュー制限: 初回は数分、連続で急増                     ║
+  ║     - コンペ: 隠しRR減 4〜12 (反復で増加)                    ║
+  ║     - パッチ11.05以降、頻繁なドッジャーへの                 ║
+  ║       ペナルティは急加速している                             ║
+  ║  ・過度なAFK/ドッジは 1日ランク制限 → ゲーム禁止まで発展    ║
+  ║  ・味方がドッジした場合は自分は無傷 (マッチキャンセル)      ║
+  ║  ・エージェント未ロックの時間切れも「ドッジ」扱い           ║
+  ║  ・使用は自己責任。通報 (griefing) の蓄積にも注意            ║
+  ╚══════════════════════════════════════════════════════════════╝
 """
+
+# ---------------------------------------------------------------------------
+# 状態ファイル (ドッジ履歴)
+# ---------------------------------------------------------------------------
+
+STATE_FILE = Path(__file__).resolve().parent / "valo_dodger_state.json"
+DODGE_WINDOW_H = 24  # この時間以内のドッジ回数をカウント
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("dodges"), list):
+            return data
+    except Exception:
+        pass
+    return {"dodges": []}
+
+
+def save_state(data: dict) -> None:
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        LOG.warning("state save failed: %s", e)
+
+
+def dodges_in_window(state: dict, window_s: float) -> list:
+    now = time.time()
+    return [t for t in state.get("dodges", []) if now - t < window_s]
+
 
 # ---------------------------------------------------------------------------
 # Paths (Windows)
@@ -217,7 +261,7 @@ class ValoAPI:
     def _local_headers(self) -> dict:
         return {"Authorization": f"Basic {self._basic}"}
 
-    # -- GLZ --
+    # -- GLZ / PD --
 
     def glz_get(self, path: str) -> tuple[int, Union[dict, str]]:
         return _http("GET", f"{self._glz_base}{path}",
@@ -226,6 +270,14 @@ class ValoAPI:
     def glz_post(self, path: str, body: Optional[bytes] = None) -> tuple[int, Union[dict, str]]:
         return _http("POST", f"{self._glz_base}{path}",
                      headers=self._game_headers(), body=body)
+
+    @property
+    def pd_base(self) -> str:
+        return f"https://pd.{self._region}.a.pvp.net"
+
+    def pd_get(self, path: str) -> tuple[int, Union[dict, str]]:
+        return _http("GET", f"{self.pd_base}{path}",
+                     headers=self._game_headers())
 
     # -- Local API --
 
@@ -237,6 +289,16 @@ class ValoAPI:
         return _http("POST", f"{self._local_base}{path}",
                      headers=self._local_headers(),
                      body=json.dumps(body).encode())
+
+    # -- セッション状態 --
+    # 返り値: "pregame" / "ingame" / "menus"
+
+    def session_state(self) -> str:
+        if self.get_pregame_player() is not None:
+            return "pregame"
+        if self.get_coregame_player() is not None:
+            return "ingame"
+        return "menus"
 
     # -- pregame --
 
@@ -260,9 +322,43 @@ class ValoAPI:
         return status == 200
 
     def quit_pregame(self, match_id: str) -> bool:
-        """⚠ 高リスク操作。API経由のドッジはRiotに検知される可能性がある。"""
+        """ドッジ (pregame 離脱)。Riot側でペナルティ判定される。"""
         status, _ = self.glz_post(f"/pregame/v1/matches/{match_id}/quit")
         return status == 200
+
+    # -- coregame --
+
+    def get_coregame_player(self) -> Optional[dict]:
+        status, data = self.glz_get(f"/core-game/v1/players/{self._puuid}")
+        if status == 404:
+            return None
+        return data if status == 200 else None
+
+    # -- party (ドッジ後のキュー制限確認) --
+
+    def get_party_restriction(self) -> Optional[dict]:
+        """パーティ情報から RestrictedSeconds (キュー制限残り秒) を取得。
+        取得できない環境では None を返す。"""
+        party_id = None
+        status, data = self.glz_get(f"/parties/v1/players/{self._puuid}")
+        if status != 200 or not isinstance(data, dict):
+            status, data = self.pd_get(f"/parties/v1/players/{self._puuid}")
+        if status == 200 and isinstance(data, dict):
+            party_id = data.get("CurrentPartyID")
+        if not party_id:
+            return None
+        status, party = self.glz_get(f"/parties/v1/parties/{party_id}")
+        if status != 200 or not isinstance(party, dict):
+            status, party = self.pd_get(f"/parties/v1/parties/{party_id}")
+        if status != 200 or not isinstance(party, dict):
+            return None
+        return {
+            "restricted_seconds": party.get("RestrictedSeconds") or 0,
+            "queue_ineligibilities": party.get("QueueIneligibilities") or [],
+            "eligible_queues": party.get("EligibleQueues") or [],
+        }
+
+    # -- chat --
 
     def get_pregame_cid(self) -> Optional[str]:
         status, data = self.local_get("/chat/v6/conversations/ares-pregame")
@@ -286,23 +382,26 @@ class ValoAPI:
         return self._glz_base
 
 
-def _trunc(x, n=300):
-    s = json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else str(x)
-    return s[:n] + ("..." if len(s) > n else "")
-
-
 # ---------------------------------------------------------------------------
-# Side detection
+# Pregame コンテキスト (マッチID / サイド / ランク / 残り時間)
 # ---------------------------------------------------------------------------
 
-def detect_player_side(api: ValoAPI, player_data: dict) -> Optional[str]:
+def _map_name(map_id: str) -> str:
+    if not map_id:
+        return "?"
+    m = re.search(r"/([A-Za-z0-9_]+)$", map_id)
+    return m.group(1) if m else map_id.split("/")[-1]
+
+
+def build_pregame_context(api: ValoAPI, player_data: dict) -> Optional[dict]:
+    """pregame 検出時のサイド判定。Blue=Defender / Red=Attacker (確定マッピング)。"""
     match_id = player_data.get("MatchID") or player_data.get("MatchId")
     if not match_id:
         return None
     match_data = api.get_pregame_match(match_id)
     if not match_data:
         return None
-    ally = match_data.get("AllyTeam", {})
+    ally = match_data.get("AllyTeam") or {}
     tid = ally.get("TeamID") or ally.get("TeamId")
     if not tid:
         for team in match_data.get("Teams", []):
@@ -312,43 +411,66 @@ def detect_player_side(api: ValoAPI, player_data: dict) -> Optional[str]:
                     break
             if tid:
                 break
-    if not tid:
-        return None
-    side = "Defense" if tid == "Blue" else "Attack" if tid == "Red" else None
+    side = None
+    if tid == "Blue":
+        side = "Defense"
+    elif tid == "Red":
+        side = "Attack"
     if side:
         LOG.info("side: %s → %s", tid, side)
-    return side
+    return {
+        "match_id": match_id,
+        "side": side,
+        "is_ranked": bool(match_data.get("IsRanked")),
+        "queue_id": match_data.get("QueueID") or "",
+        "map": _map_name(match_data.get("MapID") or ""),
+        "phase_remaining_ns": match_data.get("PhaseTimeRemainingNS") or 0,
+    }
 
 
 # ===================================================================
-# Saboteur v5 — 安全策入り
+# Saboteur v6 — 味方にドッジさせる (自分はペナルティを受けない)
 # ===================================================================
 
-# チャット爆撃用メッセージ（バリエーションでパターン回避）
+# エージェント切替用UUID (valorant-api.com から取得した正しい一覧)
+_AGENT_IDS = [
+    "add6443a-41bd-e414-f6ad-e58d267f4e95",  # Jett
+    "a3bfb853-43b2-7238-a4f1-ad90e9e46bcc",  # Reyna
+    "569fdd95-4d10-43ab-ca70-79becc718b46",  # Sage
+    "eb93336a-449b-9c1b-0a54-a891f7921d69",  # Phoenix
+    "f94c3b30-42be-e959-889c-5aa313dba261",  # Raze
+    "9f0d8ba9-4140-b941-57d3-a7ad57c6b417",  # Brimstone
+    "707eab51-4836-f488-046a-cda6bf494859",  # Viper
+    "117ed9e3-49f3-6512-3ccf-0cada7e3823b",  # Cypher
+    "320b2a48-4d9b-a075-30f1-1f93a9b638fa",  # Sova
+    "1e58de9c-4950-5125-93e9-a0aee9f98746",  # Killjoy
+    "6f2a04ca-43e0-be17-7f36-b3908627744d",  # Skye
+    "95b78ed7-4637-86d9-7e41-71ba8c293152",  # Harbor
+    "601dbbe7-43ce-be57-2a40-4abd24953621",  # KAY/O
+    "7f94d92c-4234-0a36-9646-3a87eb8b5c89",  # Yoru
+    "8e253930-4c05-31dd-1b6c-968525494517",  # Omen
+]
+
+# チャット送信用メッセージ (パターン回避のバリエーション)
 _SPAM_POOL = [
-    # ゼロ幅文字連打（メッセージとしてほぼ空だがデータ量あり）
     lambda: "\u2800" * random.randint(100, 250),
     lambda: "\u3164" * random.randint(100, 250),
-    # ブロック文字
     lambda: "\u2588" * random.randint(80, 200),
-    # 絵文字のランダムな組み合わせ
     lambda: "".join(random.choice("\U0001f4a9\U0001f525\U0001f480\U0001f389\U0001f3af\U0001f4a3\U0001f60e\U0001f921") for _ in range(random.randint(30, 60))),
-    # 改行爆弾
     lambda: "\n" * random.randint(5, 15) + "." + "\n" * random.randint(5, 15),
-    # 普通のメッセージ（たまに混ぜる）
     lambda: random.choice(["glhf", "nt", "ns", "lol", "mb", "srry"]),
 ]
 
 
 class Saboteur:
-    """味方クライアントに負荷をかける（自衛策あり）。
+    """ロビーを妨害して味方にドッジさせる（ドッジした側にペナルティが付く）。
 
-    - エージェント切替: 300〜900ms のランダム間隔（人間の操作速度に近い）
-    - チャット爆撃: 内容・頻度に揺らぎ（bot判定パターン回避）
-    - 時々数秒の沈黙（人間らしさの演出）
+    - エージェント切替: 300〜900ms のランダム間隔 (人間の操作速度に近い)
+    - チャット送信: 内容・頻度に揺らぎ (bot判定パターン回避)
+    - 時々数秒の沈黙 (人間らしさの演出)
     """
 
-    def __init__(self, api: ValoAPI, match_id: str, duration: float = 25.0):
+    def __init__(self, api: ValoAPI, match_id: str, duration: float = 30.0):
         self._api = api
         self._match_id = match_id
         self._duration = duration
@@ -370,7 +492,7 @@ class Saboteur:
         t2.start()
         self._threads.append(t2)
 
-        LOG.info("sabotage v5 (humanized, %.1fs)", self._duration)
+        LOG.info("sabotage v6 (humanized, %.1fs)", self._duration)
 
     def stop(self):
         if not self._active:
@@ -383,32 +505,15 @@ class Saboteur:
         LOG.info("sabotage stopped")
 
     def _agent_cycle(self):
-        agents = [
-            "add6443a-41bd-e414-f6ad-e58d267f4e95",  # Jett
-            "a3bfb853-43b2-7238-a4f1-ad90e9e46bcc",  # Reyna
-            "569fdd95-4d10-43ab-ca70-79becc718b46",  # Sage
-            "707eab51-4836-f488-046a-cda6bf494859",  # Phoenix
-            "eb93336a-449b-9c1b-0a54-a891f7921d69",  # Raze
-            "9f0d8ba9-4140-b941-57d3-a7ad57c6b417",  # Brimstone
-            "f94c3b30-42be-e959-889c-5aa313dba261",  # Viper
-            "117ed9e3-49f3-6512-3ccf-0cada7e3823b",  # Cypher
-            "320b2a48-4d9b-a075-30f1-1f93a9b638fa",  # Sova
-            "1e58de9e-4250-9012-b2ac-89ffe26b0f58",  # Killjoy
-            "95b78ed7-4637-86d9-7e41-71ba8c293152",  # Skye
-            "601dbbe7-43ce-be57-2a40-4abd24953621",  # Yoru
-            "8e253930-4c05-31dd-1b6c-968525494517",  # Omen
-        ]
         idx = 0
         while not self._stop_event.is_set():
-            agent = agents[idx % len(agents)]
+            agent = _AGENT_IDS[idx % len(_AGENT_IDS)]
             idx += 1
             try:
                 self._api.select_agent(self._match_id, agent)
             except Exception:
                 pass
-            # 人間らしいランダム遅延: 300〜900ms
             delay = random.uniform(0.3, 0.9)
-            # 時々長めの間を入れる
             if random.random() < 0.15:
                 delay = random.uniform(1.5, 3.0)
             self._stop_event.wait(delay)
@@ -418,12 +523,9 @@ class Saboteur:
         if not cid:
             LOG.warning("chat flood: cid 取得不可")
             return
-
         LOG.info("chat flood: cid=%s", cid)
         count = 0
-
         while not self._stop_event.is_set():
-            # メッセージ生成（毎回変わる）
             msg = random.choice(_SPAM_POOL)()
             try:
                 ok = self._api.send_chat(cid, msg)
@@ -431,14 +533,10 @@ class Saboteur:
                     count += 1
             except Exception:
                 pass
-
-            # 送信間隔に揺らぎ: 50〜200ms
             delay = random.uniform(0.05, 0.2)
-            # 時々 1〜3 秒沈黙（人間らしさ）
             if random.random() < 0.1:
                 delay = random.uniform(1.0, 3.0)
             self._stop_event.wait(delay)
-
         LOG.info("chat flood: %d messages", count)
 
     @property
@@ -452,20 +550,24 @@ class Saboteur:
 
 class DodgerMonitor:
     MODES = {
-        "sabotage": "チャット爆撃＋エージェント切替（自分は抜けない／安全）",
-        "combo": "妨害 → 最終ドッジ（最終手段にGLZ quitを使うため注意）",
-        "dodge": "即ドッジ（⚠ 高リスク・非推奨）",
+        "sabotage": "妨害のみ（味方にドッジさせる。自分にペナルティなし）",
+        "combo": "妨害 → 最終ドッジ（ペナルティ警告あり）",
+        "dodge": "即ドッジ（⚠ キュー制限 + コンペでは隠しRR減）",
     }
 
     def __init__(self, api: ValoAPI, dodge_side: str = "Attack",
                  interval: float = 2.0, dry_run: bool = False,
-                 mode: str = "sabotage", sabotage_duration: float = 25.0):
+                 mode: str = "sabotage", sabotage_duration: float = 30.0,
+                 max_dodges_per_day: int = 2, once: bool = False):
         self.api = api
         self.dodge_side = dodge_side.capitalize()
         self.interval = interval
         self.dry_run = dry_run
         self.mode = mode
         self.sabotage_duration = sabotage_duration
+        self.max_dodges_per_day = max_dodges_per_day
+        self.once = once
+        self.state = load_state()
         self._running = True
         self._last_match_id: Optional[str] = None
         self._saboteur: Optional[Saboteur] = None
@@ -483,15 +585,17 @@ class DodgerMonitor:
             self._saboteur = None
 
     def run(self):
-        print("=" * 55)
-        print("  Valo Dodger v5")
+        recent = dodges_in_window(self.state, DODGE_WINDOW_H * 3600)
+        print("=" * 58)
+        print("  Valo Dodger v6 (ペナルティ対応)")
         print(f"  GLZ:  {self.api.glz_base}")
-        print(f"  回避: {self.dodge_side} スタート")
+        print(f"  ドッジ対象: {self.dodge_side} スタート")
         print(f"  モード: {self.MODES.get(self.mode, self.mode)}")
+        print(f"  24h内ドッジ: {len(recent)} / {self.max_dodges_per_day}")
         if self.dry_run:
             print("  [DRY RUN]")
-        print(f"  間隔: {self.interval}s（ジッターあり）")
-        print("=" * 55)
+        print(f"  間隔: {self.interval}s (ジッターあり)")
+        print("=" * 58)
 
         while self._running:
             try:
@@ -502,7 +606,6 @@ class DodgerMonitor:
                     LOG.debug("待機中 (tick=%d)", self._tick_count)
             except Exception:
                 LOG.exception("tick error")
-            # ジッター付きスリープ（機械的パターン回避）
             jitter = random.uniform(-0.3, 0.3)
             self._sleep(max(1.0, self.interval + jitter))
 
@@ -512,7 +615,6 @@ class DodgerMonitor:
     def _tick(self):
         self._tick_count += 1
 
-        # トークンは30 tickごとにリフレッシュ（過剰なAPIコール回避）
         if self._tick_count % 30 == 0:
             try:
                 self.api._refresh_tokens()
@@ -530,81 +632,150 @@ class DodgerMonitor:
             return
         self._last_match_id = match_id
 
-        side = detect_player_side(self.api, player)
+        ctx = build_pregame_context(self.api, player)
+        if ctx is None:
+            print("\n⚠ サイド判定不可 (--verbose で確認)")
+            return
+        side = ctx["side"]
         if side is None:
-            print("\n⚠ サイド判定不可")
+            print("\n⚠ サイド判定不可 (TeamID 不明)")
             return
 
-        print(f"\n🎯 マッチ検出 | {match_id[:12]}... | サイド: **{side}**")
+        print(f"\n🎯 マッチ検出 | {match_id[:12]}... | {ctx['map']} | "
+              f"サイド: **{side}** | {'ランク' if ctx['is_ranked'] else 'カジュアル'}")
 
         if side != self.dodge_side:
             print(f"   ✅ {side} スタート → プレイ")
             return
 
-        self._handle(match_id, side)
+        handled = self._handle(ctx, side)
+        if self.once and handled:
+            self._running = False
 
-    def _handle(self, match_id, side):
+    def _handle(self, ctx, side) -> bool:
         if self.mode == "dodge":
-            self._do_dodge(match_id, side)
-        elif self.mode == "sabotage":
-            self._do_sabotage(match_id, side)
-        else:
-            self._do_combo(match_id, side)
+            return self._do_dodge(ctx, final=False)
+        if self.mode == "sabotage":
+            return self._do_sabotage(ctx)
+        return self._do_combo(ctx)
 
-    def _do_dodge(self, match_id, side):
-        print(f"   ⚠⚠⚠ {side} → 即ドッジ（高リスク操作！）")
+    # -- ドッジ (自分で抜ける) --
+
+    def _do_dodge(self, ctx, final: bool = False) -> bool:
+        side = ctx["side"]
+        label = "最終ドッジ" if final else "即ドッジ"
+        print(f"   ⚠⚠⚠ {side} → {label}")
+
+        recent = dodges_in_window(self.state, DODGE_WINDOW_H * 3600)
+        n = len(recent)
+        if n >= self.max_dodges_per_day:
+            print(f"   🛑 24h以内の自ドッジ {n} 回 (上限 {self.max_dodges_per_day}) のため見送り")
+            print("      ペナルティ急増中のため、妨害モードで味方に流すか待機を推奨。")
+            return False
+
+        # ペナルティ警告 (調査結果に基づく)
+        if ctx["is_ranked"]:
+            print("   ⚠ コンペティティブ: 隠しRR減の可能性 (標準ドッジで約6、反復で増加 4〜12)")
+        if n == 0:
+            print("   ⚠ 初回ドッジ: キュー制限 約数分")
+        else:
+            print(f"   ⚠ 24h以内 {n + 1} 回目のドッジ: キュー制限・RR減が急増します")
+        print("   ⚠ 過度な連続ドッジは 1日ランク制限・ゲーム禁止に発展する可能性 (自己責任)")
+
         if self.dry_run:
             print("   [DRY RUN] skip")
-            return
-        print("   ⚠ この操作はRiotに検知される可能性があります")
-        ok = self.api.quit_pregame(match_id)
-        print("   ✅ 成功" if ok else "   ❌ 失敗")
+            return False
 
-    def _do_sabotage(self, match_id, side):
+        ok = self.api.quit_pregame(ctx["match_id"])
+        if ok:
+            self.state["dodges"].append(time.time())
+            save_state(self.state)
+            print("   ✅ ドッジ成功。")
+            self._report_restriction()
+            return True
+        print("   ❌ ドッジ失敗")
+        return False
+
+    def _report_restriction(self):
+        try:
+            info = self.api.get_party_restriction()
+        except Exception:
+            info = None
+        if not info:
+            print("   (キュー制限の残り時間を取得できませんでした)")
+            return
+        sec = int(info.get("restricted_seconds") or 0)
+        if sec > 0:
+            m, s = divmod(sec, 60)
+            print(f"   ⏳ キュー制限: 残り {m}分{s}秒")
+        else:
+            print("   ✅ キュー制限なし")
+        inelig = info.get("queue_ineligibilities") or []
+        if inelig:
+            print(f"   ℹ キュー不可理由: {', '.join(map(str, inelig))}")
+
+    # -- 妨害 (味方に流させる) --
+
+    def _do_sabotage(self, ctx) -> bool:
         if self.dry_run:
-            print(f"   [DRY RUN] {side} → skip")
-            return
-        print(f"   💀 {side} → 妨害開始（人間らしいパターンで実行）")
-        print(f"   🔥 チャット爆撃＋エージェント切替 ({self.sabotage_duration}s)...")
+            print(f"   [DRY RUN] {ctx['side']} → 妨害 skip")
+            return False
+        print(f"   💀 {ctx['side']} → 妨害開始 (チャット+エージェント切替 {self.sabotage_duration}s)")
+        print("      目的: 味方にドッジさせる → ドッジした側にペナルティが付き自分は無傷")
 
-        self._saboteur = Saboteur(self.api, match_id, self.sabotage_duration)
+        self._saboteur = Saboteur(self.api, ctx["match_id"], self.sabotage_duration)
         self._saboteur.start()
 
         deadline = time.monotonic() + self.sabotage_duration
-        while self._running and time.monotonic() < deadline:
-            time.sleep(1.5)  # 監視も控えめに
-            if self.api.get_pregame_player() is None:
-                break
-
-        self._cleanup()
-        still_in = self.api.get_pregame_player()
-        print("   🎉 誰かが抜けた！" if still_in is None else "   😐 誰も抜けず...")
-
-    def _do_combo(self, match_id, side):
-        if self.dry_run:
-            print(f"   [DRY RUN] {side} → skip")
-            return
-        print(f"   💀 {side} → コンボ（妨害 {self.sabotage_duration}s → 最終ドッジ）")
-
-        self._saboteur = Saboteur(self.api, match_id, self.sabotage_duration)
-        self._saboteur.start()
-
-        deadline = time.monotonic() + self.sabotage_duration
-        dodged = False
         while self._running and time.monotonic() < deadline:
             time.sleep(1.5)
-            if self.api.get_pregame_player() is None:
-                dodged = True
+            if self.api.session_state() != "pregame":
                 break
 
         self._cleanup()
+        state = self.api.session_state()
+        if state == "menus":
+            print("   🎉 誰かが抜けた！ マッチキャンセル。自分にペナルティなし ✅")
+            return True
+        if state == "ingame":
+            print("   ⚠ 試合が始まりました（ドッジ失敗・攻めスタートで進行中）")
+            print("      未ロックのまま時間切れにすると『ドッジ』扱いで自分にペナルティが来ます。")
+            print("      プレイするか手動で離脱してください。")
+            return False
+        phase_s = ctx["phase_remaining_ns"] / 1_000_000_000 if ctx.get("phase_remaining_ns") else 0
+        print("   😐 誰も抜けませんでした。")
+        print(f"      フェーズ残り約 {max(0, int(phase_s))} 秒。放置すると時間切れ=ドッジ扱いになります。")
+        print("      自分でロックしてプレイするか、Ctrl+C で停止して combo モードを検討してください。")
+        return False
 
-        if dodged:
-            print("   🎉 誰かが抜けた！")
-        else:
-            print("   ⚠⚠⚠ 最終手段: GLZ quit（高リスク）...")
-            ok = self.api.quit_pregame(match_id)
-            print("   ✅" if ok else "   ❌ 失敗")
+    # -- コンボ: 妨害 → 最終ドッジ --
+
+    def _do_combo(self, ctx) -> bool:
+        if self.dry_run:
+            print(f"   [DRY RUN] {ctx['side']} → combo skip")
+            return False
+        print(f"   💀 {ctx['side']} → コンボ (妨害 {self.sabotage_duration}s → 最終ドッジ)")
+
+        self._saboteur = Saboteur(self.api, ctx["match_id"], self.sabotage_duration)
+        self._saboteur.start()
+
+        deadline = time.monotonic() + self.sabotage_duration
+        while self._running and time.monotonic() < deadline:
+            time.sleep(1.5)
+            if self.api.session_state() != "pregame":
+                break
+
+        self._cleanup()
+        state = self.api.session_state()
+        if state == "menus":
+            print("   🎉 誰かが抜けた！ マッチキャンセル。自分にペナルティなし ✅")
+            return True
+        if state == "ingame":
+            print("   ⚠ 試合が始まりました（ドッジ失敗・攻めスタートで進行中）")
+            return False
+
+        print("   ⚠ 誰も抜けなかったため最終手段: 自ドッジ...")
+        return self._do_dodge(ctx, final=True)
 
     def _sleep(self, seconds):
         end = time.monotonic() + seconds
@@ -617,12 +788,18 @@ class DodgerMonitor:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Valorant Auto-Dodger v5")
+    parser = argparse.ArgumentParser(description="Valorant Auto-Dodger v6")
     parser.add_argument("--mode", choices=["sabotage", "combo", "dodge"],
                         default="sabotage",
-                        help="sabotage=妨害のみ(安全), combo=妨害→最終ドッジ, dodge=即ドッジ(非推奨)")
-    parser.add_argument("--dodge", choices=["attack", "defense"], default="attack")
-    parser.add_argument("--sabotage-duration", type=float, default=25.0)
+                        help="sabotage=妨害のみ(自分にペナなし/デフォルト), combo=妨害→最終ドッジ, dodge=即ドッジ(ペナルティ注意)")
+    parser.add_argument("--dodge", choices=["attack", "defense"], default="attack",
+                        help="このサイドでスタートしたらドッジ対象にする (default: attack = 守り以外を流す)")
+    parser.add_argument("--sabotage-duration", type=float, default=30.0,
+                        help="妨害時間 (秒)。エージェント選択フェーズより短く (default: 30)")
+    parser.add_argument("--max-dodges-per-day", type=int, default=2,
+                        help="24時間以内に自分でドッジする上限 (default: 2)。超過時は妨害のみ")
+    parser.add_argument("--once", action="store_true",
+                        help="1回処理したら終了")
     parser.add_argument("--lockfile", type=Path, default=None)
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--dry-run", action="store_true")
@@ -635,7 +812,6 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    # リスク警告
     print(RISK_WARNING)
 
     lf = args.lockfile or lockfile_path()
@@ -663,6 +839,8 @@ def main():
         dodge_side="Attack" if args.dodge == "attack" else "Defense",
         interval=args.interval, dry_run=args.dry_run, mode=args.mode,
         sabotage_duration=args.sabotage_duration,
+        max_dodges_per_day=args.max_dodges_per_day,
+        once=args.once,
     )
     monitor.run()
 
