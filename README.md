@@ -4,7 +4,9 @@
 
 Valorant の local + GLZ API を使って pregame (agent select) 入室を検知し、Attack スタート（＝守りスタート以外）だった場合に自動で対処する Python スクリプト。
 
-- **clip（デフォルト）** — 攻めスタート時、クリップボードの文章をエージェントピックのチャットに数秒おきに送り続ける（エージェントは放置・自分にペナルティなし）
+- **GUI（--gui）** — チート風コントロールパネル。モード・送信間隔・仮ピック・妨害時間などを画面上で変更できる
+- **clip（デフォルト）** — 攻めスタート時、クリップボードの文章をエージェントピックのチャットに数秒おきに送り続ける（自分にペナルティなし）
+- **仮ピックローテーション** — エージェントを「選択」だけぐるぐる回す（ロックしない）。GUIのチェックか `--cycle-agents` でON
 - **sabotage** — チャット送信 + エージェント切替で味方にドッジさせる（自分は抜けない → 自分にペナルティなし）
 - **combo** — 妨害 → 誰も抜けなければ最終ドッジ
 - **dodge** — 攻め検出で即ドッジ（⚠ ペナルティあり）
@@ -41,7 +43,9 @@ Valorant の local + GLZ API を使って pregame (agent select) 入室を検知
 ```bat
 cd C:\path\to\valo-dodger
 python valo_dodger.py --dry-run --verbose   # 動作確認
-python valo_dodger.py                        # クリップボード送信（デフォルト・エージェント放置）
+python valo_dodger.py --gui                  # GUI（チート風コントロールパネル）
+python valo_dodger.py                        # クリップボード送信（デフォルト）
+python valo_dodger.py --cycle-agents         # clipで仮ピックローテーションON
 python valo_dodger.py --mode sabotage        # 妨害（チャット+エージェント切替）
 python valo_dodger.py --mode combo           # 妨害→最終ドッジ
 python valo_dodger.py --mode dodge           # 即ドッジ（ペナルティ注意）
@@ -79,7 +83,12 @@ ShooterGame.log or riot-geo API → region + shard + client_version
 
 ```
 --mode {clip,sabotage,combo,dodge}  モード選択 (default: clip)
+--gui                          GUI（チート風コントロールパネル）を起動
+--mode {clip,sabotage,combo,dodge}  モード選択 (default: clip)
 --dodge {attack,defense}       ドッジ対象サイド (default: attack = 守り以外を流す)
+--sabotage-duration SECONDS    妨害時間 (default: 30)
+--cycle-agents                 clipで仮ピック（選択のみ・ロックしない）をぐるぐる回す
+--agent-interval SECONDS       仮ピック切替の間隔 (default: 0.6)
 --sabotage-duration SECONDS    妨害時間 (default: 30)
 --chat-interval SECONDS        clipモードの送信間隔 (default: 5)
 --max-dodges-per-day N         24h以内の自ドッジ上限 (default: 2)

@@ -1,25 +1,22 @@
 @echo off
 chcp 65001 >nul
-title Valo Dodger v6
+title Valo Dodger v7
 cd /d "%~dp0"
 
 :: -----------------------------------------------
-::  Valo Dodger v6 — Windows 用ランチャー
+::  Valo Dodger v7 — Windows 用ランチャー（GUI）
 ::  この .bat をダブルクリックするだけ
 ::
-::  初回は dry-run を推奨:
-::    python valo_dodger.py --dry-run --verbose
+::  GUI の使い方:
+::    1. 送りたい文章をコピーしておく（例: dodge pls）
+::    2. 「▶ 起動」を押す
+::    3. 攻めスタートを検出すると、その文章をチャットに
+::       数秒おきに送り続けます（仮ピック切替はGUIでON）
 ::
-::  使い方: 送りたい文章をコピーしておく（例: dodge pls）
-::  攻めスタートを検出すると、その文章をチャットに
-::  数秒おきに送り続けます（エージェントは放置）
-::
-::  モード変更は下の行を編集:
-::    --mode clip     = クリップボード送信（デフォルト・推奨）
-::    --mode sabotage = 妨害（チャット+エージェント切替）
-::    --mode combo    = 妨害→最終ドッジ（ペナルティ警告あり）
-::    --mode dodge    = 即ドッジ（⚠ キュー制限+RR減）
+::  モード・送信間隔・仮ピック・妨害時間などは GUI 上で変更できます
+::  コンソールを出したくない場合は python を pythonw に変更
+::  初回動作確認: python valo_dodger.py --dry-run --verbose
 :: -----------------------------------------------
 
-python valo_dodger.py --mode clip --chat-interval 5
+python valo_dodger.py --gui
 pause

@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Valorant Auto-Dodger v6 — ペナルティ対応版
-==========================================
+Valorant Auto-Dodger v7 — GUI付き・ペナルティ対応版
+=================================================
+
+v7 からの変更:
+- GUI（チート風コントロールパネル）を追加: python valo_dodger.py --gui
+- 仮ピックローテーション: エージェントを「選択」だけぐるぐる回す（ロックしない）
+- 送信間隔・仮ピック間隔・妨害時間・ドッジ上限などをGUI/CLIから変更可能
 
 v6.2 からの変更:
 - 新モード clip (デフォルト): 攻めスタート時に、クリップボードの文章を
-  エージェントピック画面のチャットへ数秒おきに送り続ける（エージェント切替なし）
+  エージェントピック画面のチャットへ数秒おきに送り続ける
 - 起動したら常駐し、攻めスタートのマッチを検出するたびに自動送信
 
 v5 からの変更:
@@ -32,7 +37,9 @@ v5 からの変更:
 - エージェントをロックせず時間切れでも「ドッジ」扱いでペナルティが来る (AFK扱い)
 
 usage:
-  python valo_dodger.py                         # クリップボード送信 (デフォルト・エージェント放置)
+  python valo_dodger.py --gui                  # GUI（チート風コントロールパネル）
+  python valo_dodger.py                         # クリップボード送信 (デフォルト)
+  python valo_dodger.py --cycle-agents          # clipで仮ピックローテーションON
   python valo_dodger.py --mode sabotage         # 妨害 (チャット+エージェント切替)
   python valo_dodger.py --mode combo            # 妨害→最終ドッジ (ペナルティ警告あり)
   python valo_dodger.py --mode dodge            # 即ドッジ (ペナルティ・RR減注意)
@@ -546,13 +553,16 @@ def read_clipboard_text() -> Optional[str]:
 
 class ClipboardSpammer:
     """エージェント選択画面のチャットにクリップボードの文章を送り続ける。
-    エージェント切替はしない（放置）。pregame が終わるまで無限に送る。"""
+    オプションで「仮ピック（エージェント選択のみ・ロックしない）」を
+    ぐるぐる回すこともできる。pregame が終わるまで送り続ける。
+    cfg は chat_interval / cycle_agents / agent_interval を動的に参照する。"""
 
-    def __init__(self, api: ValoAPI, interval: float = 5.0):
+    def __init__(self, api: ValoAPI, match_id: str, cfg=None):
         self._api = api
-        self._interval = interval
+        self._match_id = match_id
+        self._cfg = cfg
         self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._threads: list[threading.Thread] = []
         self._active = False
         self._sent = 0
 
@@ -561,21 +571,31 @@ class ClipboardSpammer:
             return
         self._active = True
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        LOG.info("clipboard spam started (interval=%.1fs)", self._interval)
+        t1 = threading.Thread(target=self._chat_loop, daemon=True)
+        t1.start()
+        self._threads.append(t1)
+        if self._cfg and getattr(self._cfg, "cycle_agents", False):
+            t2 = threading.Thread(target=self._agent_cycle, daemon=True)
+            t2.start()
+            self._threads.append(t2)
+            LOG.info("agent 仮ピック rotation on")
 
     def stop(self):
         if not self._active:
             return
         self._active = False
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=3.0)
-            self._thread = None
+        for t in self._threads:
+            t.join(timeout=3.0)
+        self._threads.clear()
         LOG.info("clipboard spam stopped (%d sent)", self._sent)
 
-    def _loop(self):
+    def _interval(self, name: str, default: float) -> float:
+        if self._cfg is None:
+            return default
+        return getattr(self._cfg, name, default)
+
+    def _chat_loop(self):
         warned_cid = False
         warned_clip = False
         while not self._stop_event.is_set():
@@ -592,7 +612,7 @@ class ClipboardSpammer:
                     print("   ⚠ クリップボードにテキストがありません")
                     print("      ※ 送信したい文章をコピーしておくと、その内容を自動送信します")
                     warned_clip = True
-                self._stop_event.wait(self._interval)
+                self._stop_event.wait(self._interval("chat_interval", 5.0))
                 continue
             try:
                 ok = self._api.send_chat(cid, text[:400])
@@ -602,7 +622,20 @@ class ClipboardSpammer:
                         print(f"   📋 {self._sent} 回目: {text[:30]}")
             except Exception:
                 pass
-            self._stop_event.wait(self._interval)
+            self._stop_event.wait(self._interval("chat_interval", 5.0))
+
+    def _agent_cycle(self):
+        """仮ピック（select）だけぐるぐる回す。ロックはしない。"""
+        idx = 0
+        while not self._stop_event.is_set():
+            agent = _AGENT_IDS[idx % len(_AGENT_IDS)]
+            idx += 1
+            try:
+                self._api.select_agent(self._match_id, agent)
+            except Exception:
+                pass
+            base = self._interval("agent_interval", 0.6)
+            self._stop_event.wait(base * random.uniform(0.7, 1.3))
 
 
 class Saboteur:
@@ -703,6 +736,7 @@ class DodgerMonitor:
                  interval: float = 2.0, dry_run: bool = False,
                  mode: str = "clip", sabotage_duration: float = 30.0,
                  chat_interval: float = 5.0,
+                 cycle_agents: bool = False, agent_interval: float = 0.6,
                  max_dodges_per_day: int = 2, once: bool = False):
         self.api = api
         self.dodge_side = dodge_side.capitalize()
@@ -711,6 +745,8 @@ class DodgerMonitor:
         self.mode = mode
         self.sabotage_duration = sabotage_duration
         self.chat_interval = chat_interval
+        self.cycle_agents = cycle_agents
+        self.agent_interval = agent_interval
         self.max_dodges_per_day = max_dodges_per_day
         self.once = once
         self.state = load_state()
@@ -733,6 +769,11 @@ class DodgerMonitor:
         if self._spammer:
             self._spammer.stop()
             self._spammer = None
+
+    @property
+    def sent_total(self) -> int:
+        """現在のセッションの送信回数（GUI表示用）。"""
+        return self._spammer._sent if self._spammer else 0
 
     def __init__(self, api: ValoAPI, dodge_side: str = "Attack",
                  interval: float = 2.0, dry_run: bool = False,
@@ -941,9 +982,10 @@ class DodgerMonitor:
         if self.dry_run:
             print(f"   [DRY RUN] {ctx['side']} → clip skip")
             return False
-        print(f"   📋 {ctx['side']} → クリップボード送信開始（{self.chat_interval}秒間隔・エージェント放置）")
+        cyc = "＋仮ピックON" if self.cycle_agents else "エージェント放置"
+        print(f"   📋 {ctx['side']} → クリップボード送信開始（{self.chat_interval}秒間隔・{cyc}）")
         print("      味方に抜けてもらうまで送り続けます。Ctrl+C で停止。")
-        self._spammer = ClipboardSpammer(self.api, self.chat_interval)
+        self._spammer = ClipboardSpammer(self.api, ctx["match_id"], cfg=self)
         self._spammer.start()
         try:
             while self._running:
@@ -1179,9 +1221,336 @@ def print_status(api: ValoAPI) -> None:
     print("  ※ Riot は正確な閾値を公開していません。上記は公式発表 + コミュニティ情報に基づく目安です")
     print()
 
+
+
+# ===================================================================
+# GUI (--gui) — チート風コントロールパネル
+# ===================================================================
+
+try:
+    import tkinter as tk
+    _TK_OK = True
+except Exception:
+    tk = None
+    _TK_OK = False
+
+import queue as _queue
+
+_GUI_C = {
+    "bg": "#0b0f14",
+    "panel": "#11161d",
+    "panel2": "#1a2330",
+    "fg": "#c8d6e5",
+    "dim": "#5b6b7c",
+    "green": "#00ff9c",
+    "red": "#ff2e63",
+    "cyan": "#00d4ff",
+    "yellow": "#ffd166",
+}
+
+
+class TextRedirector:
+    """print() の出力をキューに流す（GUI メインスレッドで描画する）。"""
+    def __init__(self, q):
+        self.q = q
+    def write(self, s):
+        self.q.put(("auto", s))
+    def flush(self):
+        pass
+
+
+class GuiLogHandler(logging.Handler):
+    def __init__(self, q):
+        super().__init__()
+        self.q = q
+    def emit(self, record):
+        try:
+            self.q.put(("auto", self.format(record) + "\n"))
+        except Exception:
+            pass
+
+
+class DodgerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.q = _queue.Queue()
+        self.api = None
+        self.monitor = None
+        self.started = False
+        self._conn_text = "未接続"
+        self._conn_ok = False
+        self._make_vars()
+        self._build()
+        self._drain()
+        self._poll_status()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ---- 状態変数 ----
+    def _make_vars(self):
+        self.var_mode = tk.StringVar(value="clip")
+        self.var_chat = tk.BooleanVar(value=True)
+        self.var_cycle = tk.BooleanVar(value=False)
+        self.var_interval = tk.DoubleVar(value=5.0)
+        self.var_agent_interval = tk.DoubleVar(value=0.6)
+        self.var_sabotage = tk.DoubleVar(value=30.0)
+        self.var_max_dodge = tk.IntVar(value=2)
+        self.var_side = tk.StringVar(value="attack")
+
+    # ---- UI 構築 ----
+    def _build(self):
+        c = _GUI_C
+        root = self.root
+        root.title("VALO DODGER v7 — CONTROL PANEL")
+        root.configure(bg=c["bg"])
+        root.geometry("1020x700")
+        root.minsize(920, 620)
+
+        head = tk.Frame(root, bg=c["panel"], padx=14, pady=8)
+        head.pack(fill="x")
+        tk.Label(head, text="◤ VALO DODGER v7 ◢", font=("Consolas", 16, "bold"),
+                 fg=c["green"], bg=c["panel"]).pack(side="left")
+        self.lbl_dodge = tk.Label(head, text="24hドッジ: 0", font=("Consolas", 10),
+                                  fg=c["yellow"], bg=c["panel"])
+        self.lbl_dodge.pack(side="right", padx=16)
+        self.lbl_conn = tk.Label(head, text="未接続", font=("Consolas", 10, "bold"),
+                                 fg=c["red"], bg=c["panel"])
+        self.lbl_conn.pack(side="right")
+
+        main = tk.Frame(root, bg=c["bg"])
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # 左: オプションパネル
+        left = tk.Frame(main, bg=c["panel"], padx=14, pady=10)
+        left.pack(side="left", fill="y")
+        self._section(left, "EXEC MODE 実行モード")
+        for val, label in (("clip", "クリップボード送信"), ("sabotage", "妨害"),
+                           ("combo", "妨害→最終ドッジ"), ("dodge", "即ドッジ")):
+            tk.Radiobutton(left, text=label, variable=self.var_mode, value=val,
+                           fg=c["fg"], bg=c["panel"], selectcolor=c["panel2"],
+                           activebackground=c["panel"], activeforeground=c["green"],
+                           font=("Consolas", 10), anchor="w").pack(fill="x")
+
+        self._section(left, "ACTIONS 動作オプション")
+        tk.Checkbutton(left, text="クリップボード送信", variable=self.var_chat,
+                       fg=c["fg"], bg=c["panel"], selectcolor=c["panel2"],
+                       activebackground=c["panel"], activeforeground=c["green"],
+                       font=("Consolas", 10), anchor="w").pack(fill="x")
+        tk.Checkbutton(left, text="仮ピックローテーション（ロックしない）", variable=self.var_cycle,
+                       fg=c["cyan"], bg=c["panel"], selectcolor=c["panel2"],
+                       activebackground=c["panel"], activeforeground=c["cyan"],
+                       font=("Consolas", 10), anchor="w").pack(fill="x")
+
+        self._section(left, "CHAT INTERVAL 送信間隔 (秒)")
+        tk.Scale(left, from_=1, to=30, resolution=0.5, orient="horizontal",
+                 variable=self.var_interval, fg=c["fg"], bg=c["panel"],
+                 highlightthickness=0, troughcolor=c["panel2"]).pack(fill="x")
+
+        self._section(left, "PICK INTERVAL 仮ピック間隔 (秒)")
+        tk.Scale(left, from_=0.3, to=3.0, resolution=0.1, orient="horizontal",
+                 variable=self.var_agent_interval, fg=c["fg"], bg=c["panel"],
+                 highlightthickness=0, troughcolor=c["panel2"]).pack(fill="x")
+
+        self._section(left, "SABOTAGE TIME 妨害時間 (秒)")
+        tk.Scale(left, from_=5, to=60, resolution=1, orient="horizontal",
+                 variable=self.var_sabotage, fg=c["fg"], bg=c["panel"],
+                 highlightthickness=0, troughcolor=c["panel2"]).pack(fill="x")
+
+        self._section(left, "DODGE LIMIT 24h自ドッジ上限")
+        tk.Spinbox(left, from_=0, to=10, textvariable=self.var_max_dodge, width=5,
+                   fg=c["fg"], bg=c["panel2"], buttonbackground=c["panel2"],
+                   font=("Consolas", 10)).pack(anchor="w")
+
+        self._section(left, "DODGE SIDE ドッジ対象")
+        for val, label in (("attack", "攻めスタートを流す"), ("defense", "守りスタートを流す")):
+            tk.Radiobutton(left, text=label, variable=self.var_side, value=val,
+                           fg=c["fg"], bg=c["panel"], selectcolor=c["panel2"],
+                           activebackground=c["panel"], activeforeground=c["green"],
+                           font=("Consolas", 10), anchor="w").pack(fill="x")
+
+        # 右: ライブログ
+        right = tk.Frame(main, bg=c["bg"])
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        self.log = tk.Text(right, bg=c["panel2"], fg=c["fg"], insertbackground=c["green"],
+                           font=("Consolas", 9), wrap="word", relief="flat",
+                           padx=10, pady=8)
+        self.log.pack(fill="both", expand=True)
+        self.log.tag_configure("log", foreground=c["fg"])
+        self.log.tag_configure("info", foreground=c["cyan"])
+        self.log.tag_configure("ok", foreground=c["green"])
+        self.log.tag_configure("warn", foreground=c["yellow"])
+        self.log.tag_configure("err", foreground=c["red"])
+        self.log.insert("end", ">> VALO DODGER v7 起動\n", ("ok",))
+        self.log.insert("end", ">> 送りたい文章をコピーしておいてください\n", ("info",))
+
+        # ボトム: ボタン
+        bottom = tk.Frame(root, bg=c["panel"], padx=14, pady=8)
+        bottom.pack(fill="x")
+        self._btn_start = tk.Button(bottom, text="▶ 起動", command=self._start,
+                                    font=("Consolas", 11, "bold"), fg="#06120c",
+                                    bg=c["green"], activebackground=c["green"],
+                                    relief="flat", padx=18)
+        self._btn_start.pack(side="left")
+        self.lbl_sent = tk.Label(bottom, text="送信: 0", font=("Consolas", 10),
+                                fg=c["green"], bg=c["panel"])
+        self.lbl_sent.pack(side="left", padx=16)
+        tk.Button(bottom, text="⟳ ステータス取得", command=self._fetch_status,
+                  font=("Consolas", 10), fg=c["cyan"], bg=c["panel2"],
+                  activebackground=c["panel2"], relief="flat", padx=10).pack(side="left")
+        tk.Button(bottom, text="⏹ 終了", command=self._on_close,
+                  font=("Consolas", 10), fg=c["red"], bg=c["panel2"],
+                  activebackground=c["panel2"], relief="flat", padx=12).pack(side="right")
+
+    def _section(self, parent, title):
+        c = _GUI_C
+        tk.Label(parent, text=title, font=("Consolas", 9, "bold"),
+                 fg=c["dim"], bg=c["panel"], anchor="w").pack(fill="x", pady=(8, 2))
+
+    # ---- ログ描画 (メインスレッドのみ) ----
+    def _tag_for(self, s):
+        if s.startswith("❌") or "失敗" in s or "Error" in s or "Traceback" in s:
+            return "err"
+        if s.startswith("⚠") or "制限" in s or "警告" in s:
+            return "warn"
+        if s.startswith(("✅", "🎉", "🎯", "📋", ">>")):
+            return "ok"
+        if s.startswith(("INFO", "[")):
+            return "info"
+        return "log"
+
+    def _drain(self):
+        try:
+            while True:
+                tag, s = self.q.get_nowait()
+                if tag == "auto":
+                    tag = self._tag_for(s)
+                self.log.insert("end", s, (tag,))
+        except _queue.Empty:
+            pass
+        try:
+            self.log.see("end")
+        except Exception:
+            pass
+        self.root.after(100, self._drain)
+
+    # ---- 起動 / 停止 ----
+    def _start(self):
+        if self.started:
+            return
+        self.started = True
+        self._btn_start.config(text="■ 停止", command=self._stop,
+                              fg="#12060a", bg=_GUI_C["red"], activebackground=_GUI_C["red"])
+        threading.Thread(target=self._run_monitor, daemon=True).start()
+
+    def _run_monitor(self):
+        try:
+            if self.api is None:
+                self.q.put(("auto", ">> 接続中...\n"))
+                self.api = self._make_api()
+            self.q.put(("auto", f">> 接続OK | {self.api.glz_base}\n"))
+            self._conn_text = f"ONLINE | {self.api.glz_base}"
+            self._conn_ok = True
+            self.monitor = self._build_monitor()
+            self.monitor.run()
+        except Exception as e:
+            self.q.put(("auto", f"❌ {e}\n"))
+            self.started = False
+            self.root.after(0, self._reset_start_btn)
+
+    def _reset_start_btn(self):
+        self._btn_start.config(text="▶ 起動", command=self._start,
+                              fg="#06120c", bg=_GUI_C["green"], activebackground=_GUI_C["green"])
+
+    def _stop(self):
+        if self.monitor:
+            self.monitor._running = False
+            self.monitor._cleanup()
+        self.started = False
+        self.q.put(("auto", ">> 停止しました\n"))
+        self._reset_start_btn()
+
+    def _make_api(self):
+        lf = lockfile_path()
+        if not lf.exists():
+            raise RuntimeError(f"lockfile なし: {lf}（Valorantを起動してください）")
+        parts = lf.read_text().strip().split(":")
+        api = ValoAPI(int(parts[2]), parts[3])
+        api.connect()
+        return api
+
+    def _build_monitor(self):
+        return DodgerMonitor(
+            api=self.api,
+            dodge_side="Attack" if self.var_side.get() == "attack" else "Defense",
+            mode=self.var_mode.get(),
+            sabotage_duration=self.var_sabotage.get(),
+            chat_interval=self.var_interval.get(),
+            cycle_agents=self.var_cycle.get(),
+            agent_interval=self.var_agent_interval.get(),
+            max_dodges_per_day=self.var_max_dodge.get(),
+            once=False,
+        )
+
+    # ---- ライブ反映 & ステータス ----
+    def _poll_status(self):
+        if self.monitor:
+            m = self.monitor
+            m.mode = self.var_mode.get()
+            m.dodge_side = "Attack" if self.var_side.get() == "attack" else "Defense"
+            m.chat_interval = self.var_interval.get()
+            m.agent_interval = self.var_agent_interval.get()
+            m.sabotage_duration = self.var_sabotage.get()
+            m.cycle_agents = self.var_cycle.get()
+            m.max_dodges_per_day = self.var_max_dodge.get()
+        state = load_state()
+        n24 = len(dodges_in_window(state, DODGE_WINDOW_H * 3600))
+        self.lbl_dodge.config(text=f"24hドッジ: {n24}")
+        if self.monitor:
+            self.lbl_sent.config(text=f"送信: {self.monitor.sent_total}")
+        self.lbl_conn.config(text=self._conn_text,
+                             fg=_GUI_C["green"] if self._conn_ok else _GUI_C["red"])
+        self.root.after(1000, self._poll_status)
+
+    def _fetch_status(self):
+        def work():
+            try:
+                api = self.api
+                if api is None:
+                    self.q.put(("auto", ">> 接続中...\n"))
+                    api = self._make_api()
+                    self.api = api
+                print_status(api)
+            except Exception as e:
+                self.q.put(("auto", f"❌ ステータス取得失敗: {e}\n"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_close(self):
+        self._stop()
+        self.root.destroy()
+
+
+def run_gui() -> None:
+    """GUI を起動する（--gui）。stdout/stderr とログを画面に流す。"""
+    if not _TK_OK:
+        print("tkinter が利用できません。GUI を無効にした Python で実行されています。")
+        print("通常の python (pythonw 以外) で実行してください。")
+        return
+    root = tk.Tk()
+    app = DodgerGUI(root)
+    redirector = TextRedirector(app.q)
+    sys.stdout = redirector
+    sys.stderr = redirector
+    handler = GuiLogHandler(app.q)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().addHandler(handler)
+    root.mainloop()
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
 
 def main():
     parser = argparse.ArgumentParser(description="Valorant Auto-Dodger v6")
@@ -1194,6 +1563,12 @@ def main():
                         help="妨害時間 (秒)。エージェント選択フェーズより短く (default: 30)")
     parser.add_argument("--chat-interval", type=float, default=5.0,
                         help="クリップボード送信の間隔 (秒) (default: 5)")
+    parser.add_argument("--cycle-agents", action="store_true",
+                        help="clipモードで仮ピック（エージェント選択のみ・ロックしない）をぐるぐる回す")
+    parser.add_argument("--agent-interval", type=float, default=0.6,
+                        help="仮ピック切替の間隔 (秒) (default: 0.6)")
+    parser.add_argument("--gui", action="store_true",
+                        help="GUI（チート風コントロールパネル）を起動")
     parser.add_argument("--max-dodges-per-day", type=int, default=2,
                         help="24時間以内に自分でドッジする上限 (default: 2)。超過時は妨害のみ")
     parser.add_argument("--once", action="store_true",
@@ -1205,6 +1580,10 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
+
+    if args.gui:
+        run_gui()
+        sys.exit(0)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -1244,6 +1623,8 @@ def main():
         interval=args.interval, dry_run=args.dry_run, mode=args.mode,
         sabotage_duration=args.sabotage_duration,
         chat_interval=args.chat_interval,
+        cycle_agents=args.cycle_agents,
+        agent_interval=args.agent_interval,
         max_dodges_per_day=args.max_dodges_per_day,
         once=args.once,
     )
